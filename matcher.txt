@@ -1,0 +1,1469 @@
+"""
+Step 2: match Alteryx -> SOI (CY/PY) and produce the review Excel.
+
+Standalone usage (without the launcher):
+    python matcher.py      -> file dialogs: Alteryx folder, SOI CY PDF, SOI PY PDF
+Output: Review_<timestamp>.xlsx in the Alteryx folder (or in output/ when run from the launcher)
+
+Requires: pip install pdfplumber pandas openpyxl rapidfuzz   (rapidfuzz optional)
+"""
+
+import copy
+import hashlib
+import json
+import re
+from datetime import datetime, date
+from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
+
+import pandas as pd
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+
+try:
+    from rapidfuzz import fuzz as _fuzz
+
+    def score_set(a, b):
+        return _fuzz.token_set_ratio(a, b)
+
+    def score_sort(a, b):
+        return _fuzz.token_sort_ratio(a, b)
+except ImportError:  # fallback without rapidfuzz
+    from difflib import SequenceMatcher
+
+    def score_sort(a, b):
+        return 100 * SequenceMatcher(None, " ".join(sorted(a.split())), " ".join(sorted(b.split()))).ratio()
+
+    def score_set(a, b):
+        ta, tb = set(a.split()), set(b.split())
+        if not ta or not tb:
+            return 0
+        if ta <= tb or tb <= ta:
+            return 100
+        inter = " ".join(sorted(ta & tb))
+        return max(score_sort(inter + " " + " ".join(sorted(ta - tb)), inter + " " + " ".join(sorted(tb - ta))),
+                   score_sort(a, b))
+
+# ======================= DEFAULT SETTINGS =======================
+# The client profile (clients/*.json) can override any of these keys.
+DEFAULTS = {
+    "alteryx": {
+        "sheet_purchases": "Significant Purchases",
+        "sheet_sales": "Significant Sales",
+        "columns": {
+            "fund_id": "Fund Id", "asset_id": "Primary Asset ID", "description": "Issue Description",
+            "maturity": "Maturity Date", "coupon": "Coupon", "nominal": "Position",
+            "amount": "Principal Base", "currency": "Asset Currency",
+            "security_type": "Security Type", "sub_security_type": "Sub Security Type",
+        },
+        "maturity_us_format": True,
+    },
+    "name_format": {
+        "coupon_decimals": 3,
+        "date_format": "%d/%m/%y",
+        "zcp_text": "ZCP",
+        # removed only at the END of a name ("WOORI BANK PERP FRN EMNT" -> "WOORI BANK", but "HYSAN MTN LTD" stays)
+        "strip_suffixes": ["EMNT", "GMTN", "EMTN", "MTN", "PERP", "FRN", "SR", "SUB", "NTS", "REGS", "144A"],
+        # removed anywhere (PVAL: "GREAT EASTERN LIFE ASSUR REGD V/R /PERP/ REG S EMTN")
+        "noise_phrases": ["REGD", "REG S", "V/R", "/PERP/", "REGS"],
+        # Bloomberg 144A_FLAG = Y -> " 144A" appended to the issuer (SOI convention, e.g. "Bandhan Bank Ltd 144A").
+        # Equity: after the name ("BlackBuck Ltd 144A"); Debt: after the date ("Issuer, 5.300%, 08/01/29 144A")
+        "append_144a_for": ["Equity", "Debt"],
+        "keep_upper": ["PT", "LG", "KB", "BDO", "KT&G", "CDBL", "MISC", "BVI", "HK", "US", "USA", "PLC",
+                       "LLC", "SA", "AG", "NV", "AB", "ASA", "SPA", "L&T", "ICICI", "HDFC", "DLF", "AU", "JSW"],
+    },
+    "matching": {
+        "purchases_order": ["SOI_CY", "SOI_PY"],
+        "sales_order": ["SOI_PY", "SOI_CY"],
+        "issuer_min_score": 85,
+        "relaxed_issuer_score": 92,
+        "equity_fuzzy_score": 90,
+        "equity_security_types": ["CS", "PS", "EQ", "ETF", "REIT", "ADR", "GDR", "PFD"],
+        "debt_security_types": ["CB", "GB", "ST", "BOND", "FRN", "MBS", "ABS", "CD", "CP", "TBILL"],
+        "zcp_sub_types": ["TBILL"],
+        # ignored when comparing names: "HAIER SMART HOME CO LTD - A" (Alteryx) = "Haier Smart Home Co Ltd Class A" (SOI)
+        "drop_tokens": ["144A", "REGS", "CLASS"],
+        # cross-check: minimum issuer-name similarity between the proposed name and Bloomberg/PVAL (by Asset ID)
+        "crosscheck_name_score": 75,
+    },
+    # External sources (Bloomberg, PVAL). Column names are auto-detected; list them here only if detection fails.
+    "external_order": ["BLOOMBERG", "PVAL"],
+    "external_sources": {
+        "BLOOMBERG": {"id_columns": [], "name_columns": [], "coupon_columns": [], "maturity_columns": [],
+                      "maturity_us_format": True},
+        "PVAL": {"id_columns": [], "name_columns": [], "coupon_columns": [], "maturity_columns": [],
+                 "maturity_us_format": True},
+    },
+    # legacy: {"7593": "ASIA INVESTMENT GRADE"} - use the fund map file data/funds_<client>.xlsx instead
+    "fund_map": {},
+}
+
+ABBR = {"CORPORATION": "CORP", "LIMITED": "LTD", "COMPANY": "CO", "INCORPORATED": "INC"}
+
+GREEN, YELLOW, RED = "GREEN", "YELLOW", "RED"
+FILLS = {GREEN: PatternFill("solid", fgColor="C6EFCE"), YELLOW: PatternFill("solid", fgColor="FFEB9C"),
+         RED: PatternFill("solid", fgColor="FFC7CE")}
+
+
+def merge_profile(profile):
+    out = copy.deepcopy(DEFAULTS)
+
+    def _m(dst, src):
+        for k, v in (src or {}).items():
+            if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                _m(dst[k], v)
+            else:
+                dst[k] = v
+    _m(out, profile)
+    return out
+
+
+# ============================ NORMALISATION ============================
+def norm(text, drop=()):
+    s = str(text or "").upper()
+    s = re.sub(r"[^\w&]", " ", s)
+    toks = [ABBR.get(t, t) for t in s.split() if t not in drop]
+    return " ".join(toks)
+
+
+def clean_issuer_text(text, cfg):
+    """Removes coupons, dates, ZCP, noise phrases (REGD, REG S, V/R, /PERP/) and trailing programme
+    suffixes (EMTN, GMTN, PERP, FRN ...). 'BANK MANDIRI PT EMTN 4.900% 24/03/2028' -> 'BANK MANDIRI PT'."""
+    s = str(text or "")
+    s = re.sub(r"\d{1,2}/\d{1,2}/\d{2,4}", " ", s)          # dates
+    s = re.sub(r"\b\d+\s+\d+/\d+\b", " ", s)                # Bloomberg fraction coupons '5 1/8'
+    s = re.sub(r"\d+(\.\d+)?%", " ", s)                       # '5.125%'
+    s = re.sub(r"\bZCP\b", " ", s, flags=re.I)
+    for ph in cfg["name_format"].get("noise_phrases", []):
+        s = re.sub(r"(?<![\w/])" + re.escape(ph) + r"(?![\w/])", " ", s, flags=re.I)
+    toks = s.split()
+    sfx = {x.upper() for x in cfg["name_format"]["strip_suffixes"]}
+    while toks and toks[-1].upper().strip(",/") in sfx:
+        toks = toks[:-1]
+    return " ".join(toks).strip(" ,/")
+
+
+def alteryx_issuer(desc, cfg):
+    return norm(clean_issuer_text(desc, cfg), set(cfg["matching"]["drop_tokens"]))
+
+
+def dkey(d):
+    """Date key dd/mm/yy - 2174 and 2074 are treated as the same date (perpetuals)."""
+    if _isna(d):
+        return None
+    try:
+        return (d.day, d.month, d.year % 100)
+    except AttributeError:
+        return None
+
+
+def _isna(v):
+    try:
+        return v is None or bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def to_date(v, us=True):
+    if _isna(v) or str(v).strip().upper() in ("", "NAN", "NAT", "N.A.", "N/A", "NA", "#N/A"):
+        return None
+    if isinstance(v, (datetime, date, pd.Timestamp)):
+        return pd.Timestamp(v).to_pydatetime()
+    t = str(v).strip()
+    t = t[:-2] if t.endswith(".0") else t
+    if re.fullmatch(r"(19|20|21)\d{6}", t):  # Bloomberg yyyymmdd, e.g. 20290115
+        try:
+            return datetime.strptime(t, "%Y%m%d")
+        except ValueError:
+            return None
+    for fmt in (["%m/%d/%Y", "%d/%m/%Y"] if us else ["%d/%m/%Y", "%m/%d/%Y"]) + ["%Y-%m-%d", "%Y-%m-%d %H:%M:%S"]:
+        try:
+            return datetime.strptime(str(v).strip(), fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def to_float(v):
+    """1,234.5 / (1,234.50) / 1234.5- / '' -> float or None."""
+    if _isna(v):
+        return None
+    t = str(v).strip().replace(",", "").replace(" ", "")
+    neg = (t.startswith("(") and t.endswith(")")) or t.endswith("-")
+    t = t.strip("()").rstrip("-")
+    try:
+        f = float(t)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(f):
+        return None
+    return -f if neg else f
+
+
+def title_name(text, cfg):
+    keep = {k.upper() for k in cfg["name_format"]["keep_upper"]}
+    out = []
+    for w in str(text).split():
+        out.append(w if w.upper() in keep else "/".join(p.capitalize() for p in w.split("/")))
+    return " ".join(out).replace(" Of ", " of ").replace(" And ", " and ")
+
+
+class IssuerBook:
+    """Issuer spellings taken from all SOIs (all funds, CY + PY), e.g. 'POWER FINANCE CORP LTD' -> 'Power Finance Corp. Ltd'."""
+
+    def __init__(self, soi_frames):
+        self.items = {}
+        for d in soi_frames:
+            if d is None or d.empty:
+                continue
+            for n, iss, t in zip(d["_n"], d["Issuer"], d["Type"]):
+                self.items.setdefault((t, n), iss)
+
+    def spell(self, issuer_norm, kind, min_score=95):
+        if (kind, issuer_norm) in self.items:
+            return self.items[(kind, issuer_norm)]
+        best, best_sc = None, 0
+        for (t, n), iss in self.items.items():
+            if t != kind:
+                continue
+            sc = score_sort(issuer_norm, n)
+            if sc > best_sc:
+                best, best_sc = iss, sc
+        return best if best_sc >= min_score else None
+
+
+def fmt_coupon(c, decimals):
+    """Rounds half UP like the published notes (1.0625 -> 1.063), not Python's half-to-even (1.062)."""
+    q = Decimal(1).scaleb(-decimals)
+    return str(Decimal(str(c)).quantize(q, rounding=ROUND_HALF_UP))
+
+
+def format_name(issuer, kind, coupon, maturity, zcp, cfg, suffix=""):
+    """Builds a name in the SOI format: 'Issuer, 5.125%, 05/11/35' / 'Issuer ZCP, 29/04/25' / 'Issuer'.
+    suffix (e.g. '144A') goes after the date for debt."""
+    nf = cfg["name_format"]
+    if kind == "Equity":
+        return issuer
+    dtxt = maturity.strftime(nf["date_format"]) if maturity is not None else "[DATE?]"
+    sfx = f" {suffix}" if suffix else ""
+    if zcp:
+        return f"{issuer} {nf['zcp_text']}, {dtxt}{sfx}"
+    if coupon is None:
+        return f"{issuer}, [COUPON?]%, {dtxt}{sfx}"
+    return f"{issuer}, {fmt_coupon(coupon, nf['coupon_decimals'])}%, {dtxt}{sfx}"
+
+
+def _split_144a(issuer):
+    """'Hyundai Capital America 144A' -> ('Hyundai Capital America', True)"""
+    toks = str(issuer).split()
+    has = any(t.upper() == "144A" for t in toks)
+    return " ".join(t for t in toks if t.upper() != "144A"), has
+
+
+def build_rule_name(row, cfg, book=None):
+    """Name built from Alteryx data (last resort) - always requires review. Returns (name, issuer_from_soi)."""
+    soi_spelling = book.spell(row["_issuer"], row["_kind"]) if book else None
+    issuer = soi_spelling or title_name(row["_issuer_raw"], cfg)
+    d = None if _isna(row["_maturity"]) else row["_maturity"]
+    cpn = None if row["_float"] else row["_coupon"]
+    sfx = ""
+    allowed = cfg["name_format"].get("append_144a_for", [])
+    has = bool(row.get("_has144a"))  # 144A in the Alteryx description
+    if row["_kind"] == "Debt":  # bonds: 144A goes after the date
+        issuer, had = _split_144a(issuer)
+        sfx = "144A" if (has or had) and "Debt" in allowed else ""
+    elif has and "Equity" in allowed and "144A" not in issuer.upper().split():
+        issuer = f"{issuer} 144A"
+    return format_name(issuer, row["_kind"], cpn, d, row["_zcp"], cfg, sfx), soi_spelling is not None
+
+
+# ============================ ALTERYX ============================
+def find_col(df, wanted):
+    w = wanted.strip().lower()
+    for c in df.columns:
+        if str(c).strip().lower() == w:
+            return c
+    for c in df.columns:
+        if str(c).strip().lower().startswith(w[:10]):
+            return c
+    return None
+
+
+def _fid(v):
+    """Fund Id as text: 7593.0 -> '7593'."""
+    if _isna(v):
+        return ""
+    return str(int(v)) if isinstance(v, float) and v == int(v) else str(v).strip()
+
+
+def read_alteryx_folder(folder, cfg, log=print):
+    """Returns (rows to match, raw rows for the Completeness Check).
+    Raw = every row with a Fund Id, INCLUDING rows without an Issue Description - those cannot be matched,
+    so they are logged and make the Completeness Check show DIFFERENCE instead of disappearing silently.
+    Rows with neither Fund Id nor description (blank / total lines) are ignored."""
+    ax = cfg["alteryx"]
+    cols = ax["columns"]
+    frames, raws = [], []
+    for f in sorted(Path(folder).glob("*.xls*")):
+        if f.name.startswith("~$"):
+            continue
+        try:
+            book = pd.ExcelFile(f)
+        except Exception as e:  # noqa: BLE001 - name the file that cannot be opened
+            raise ValueError(f"{f.name}: cannot open ({e})") from e
+        real = {re.sub(r"\s+", " ", n).strip().upper(): n for n in book.sheet_names}
+        found = 0
+        for side, sheet in (("Purchases", ax["sheet_purchases"]), ("Sales", ax["sheet_sales"])):
+            name = real.get(re.sub(r"\s+", " ", sheet).strip().upper())
+            if name is None:
+                log(f"  WARNING: {f.name}: sheet '{sheet}' not found - {side} skipped for this file")
+                continue
+            found += 1
+            df = pd.read_excel(book, sheet_name=name)
+            if df.empty:
+                continue
+            m = {k: find_col(df, v) for k, v in cols.items()}
+            missing = [cols[k] for k in ("fund_id", "description", "nominal", "amount") if m[k] is None]
+            if missing:
+                raise ValueError(f"{f.name} / {sheet}: missing columns {missing}")
+            out = pd.DataFrame({k: (df[c] if c is not None else None) for k, c in m.items()})
+            out["side"] = side
+            out["order"] = range(1, len(out) + 1)
+            out["file"] = f.name
+            has_fid = out["fund_id"].apply(lambda v: _fid(v) != "")
+            has_desc = out["description"].apply(lambda v: not _isna(v) and str(v).strip() != "")
+            raws.append(out[has_fid | has_desc][["fund_id", "side", "amount"]])
+            skipped = out[has_fid & ~has_desc]
+            for _, r in skipped.iterrows():
+                log(f"  WARNING: {f.name} / {sheet} row {r['order']}: no Issue Description - row skipped "
+                    f"(amount {r['amount']}); Completeness Check will show DIFFERENCE")
+            frames.append(out[has_desc])
+        if not found:
+            log(f"  WARNING: {f.name}: neither '{ax['sheet_purchases']}' nor '{ax['sheet_sales']}' found - file skipped")
+    if not frames:
+        raise ValueError(f"No Alteryx files with Significant sheets found in: {folder}")
+    df = pd.concat(frames, ignore_index=True)
+    df["fund_id"] = df["fund_id"].apply(_fid)
+    raw = pd.concat(raws, ignore_index=True)
+    raw["fund_id"] = raw["fund_id"].apply(_fid)
+    return df, raw
+
+
+def enrich_alteryx(df, cfg):
+    mt = cfg["matching"]
+    eq_types = {t.upper() for t in mt["equity_security_types"]}
+    debt_types = {t.upper() for t in mt.get("debt_security_types", [])}
+    zcp_sub = {t.upper() for t in mt["zcp_sub_types"]}
+    us = cfg["alteryx"].get("maturity_us_format", True)
+    recs = []
+    for _, r in df.iterrows():
+        desc = str(r["description"])
+        cpn = to_float(r.get("coupon")) or 0.0
+        mat = to_date(r.get("maturity"), us)
+        st = str(r.get("security_type") or "").strip().upper()
+        sub = str(r.get("sub_security_type") or "").strip().upper()
+        # no coupon and no maturity looks like equity - but only when the Security Type does not say debt
+        is_eq = st in eq_types or (st not in debt_types and cpn == 0 and mat is None)
+        zcp = (not is_eq) and cpn == 0 and ("ZCP" in desc.upper() or sub in zcp_sub)
+        flt = (not is_eq) and cpn == 0 and not zcp
+        issuer_raw = clean_issuer_text(desc, cfg)
+        if is_eq:  # "HAIER SMART HOME CO LTD - A" -> "... Class A" (SOI convention)
+            issuer_raw = re.sub(r"\s*-\s*([A-Z])$", r" Class \1", issuer_raw)
+        recs.append({
+            "_kind": "Equity" if is_eq else "Debt", "_coupon": cpn, "_maturity": mat, "_zcp": zcp,
+            "_float": flt, "_issuer": alteryx_issuer(desc, cfg) if not is_eq else norm(desc, set(mt["drop_tokens"])),
+            "_issuer_raw": issuer_raw.strip(), "_dkey": dkey(mat),
+            "_has144a": bool(re.search(r"\b144A\b", desc, flags=re.I)),
+        })
+    return pd.concat([df.reset_index(drop=True), pd.DataFrame(recs)], axis=1)
+
+
+# ============================ SOI ============================
+def prep_soi(df, cfg):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Fund", "Type", "Name_publication", "_n", "_dkey", "Coupon", "ZCP"])
+    d = df.copy()
+    drop = set(cfg["matching"]["drop_tokens"])
+    d["_n"] = [norm(n, drop) for n in d["Issuer"]]
+    d["_dkey"] = [dkey(m) for m in d["Maturity"]]
+    return d
+
+
+def _soi_index(soi):
+    """Which SOI funds hold a security: equity name / (date, coupon) / (date, ZCP) / date."""
+    idx = {"eq": {}, "cpn": {}, "zcp": {}, "date": {}, "eq_names": {}}
+    if soi is None or soi.empty:
+        return idx
+    for f, t, n, dk, cpn, z in zip(soi["Fund"], soi["Type"], soi["_n"], soi["_dkey"], soi["Coupon"], soi["ZCP"]):
+        if f is None or _isna(f):
+            continue
+        if t == "Equity":
+            idx["eq"].setdefault(n, set()).add(f)
+            continue
+        if dk is None:
+            continue
+        idx["date"].setdefault(dk, set()).add(f)
+        if z == True:  # noqa: E712
+            idx["zcp"].setdefault(dk, set()).add(f)
+        elif not _isna(cpn):
+            idx["cpn"].setdefault((dk, round(float(cpn), 4)), set()).add(f)
+    return idx
+
+
+def _funds_holding(row, idx, fuzzy=False):
+    if row["_kind"] == "Equity":
+        hit = idx["eq"].get(row["_issuer"], set())
+        if not hit and fuzzy:
+            hit = set()
+            for n, fs in idx["eq"].items():
+                if score_sort(row["_issuer"], n) >= 92:
+                    hit |= fs
+        return hit
+    if row["_dkey"] is None:
+        return set()
+    if row["_zcp"]:
+        return idx["zcp"].get(row["_dkey"], set())
+    if row["_float"]:
+        return idx["date"].get(row["_dkey"], set())
+    return idx["cpn"].get((row["_dkey"], round(float(row["_coupon"]), 4)), set())
+
+
+def _auto_detect(rows, idx, names):
+    """Automatic fund detection for one Alteryx Fund Id (all its purchases + sales rows).
+    Each hit is weighted 1 / (number of SOI funds holding that security): a bond held by both US and Global
+    High Yield counts 0.5 for each, a bond only one fund holds counts 1 - so the distinctive holdings decide.
+    Joint pass: CY and PY together, same fund name in both years = same fund.
+    If the winner exists in only one year, the OTHER year is searched on its own (fund renamed).
+    Returns (cy_name, cy_hit%, py_name, py_hit%, note)."""
+    n = len(rows)
+    for fuzzy in (False, True):
+        score, hits = {}, {"CY": {}, "PY": {}}
+        yscore = {"CY": {}, "PY": {}}
+        for _, r in rows.iterrows():
+            for yr in ("CY", "PY"):
+                fs = _funds_holding(r, idx[yr], fuzzy)
+                for f in fs:
+                    score[f] = score.get(f, 0) + 1 / len(fs)
+                    yscore[yr][f] = yscore[yr].get(f, 0) + 1 / len(fs)
+                    hits[yr][f] = hits[yr].get(f, 0) + 1
+        ranked = sorted(score, key=lambda f: (score[f], hits["CY"].get(f, 0) + hits["PY"].get(f, 0)), reverse=True)
+        if not ranked:
+            continue
+        best = ranked[0]
+        if max(hits["CY"].get(best, 0), hits["PY"].get(best, 0)) / n < 0.2:
+            continue
+        pick = {}
+        for yr in ("CY", "PY"):
+            if best in names[yr]:
+                pick[yr] = best
+                continue
+            # winner not in this year's SOI (renamed, new or closed fund): best fund of THIS year alone, only if
+            # convincing - at least 2 hits and 10% of the rows, and no close second
+            cand = sorted(yscore[yr], key=lambda f: (yscore[yr][f], hits[yr].get(f, 0)), reverse=True)
+            ok = cand and hits[yr].get(cand[0], 0) >= max(2, 0.1 * n) and \
+                (len(cand) == 1 or yscore[yr][cand[1]] < 0.8 * yscore[yr][cand[0]])
+            pick[yr] = cand[0] if ok else None
+        note = "AUTO - OK"
+        if len(ranked) > 1 and score[ranked[1]] >= 0.8 * score[best]:
+            note = f"AUTO - AMBIGUOUS - close second: {ranked[1]} (score {score[ranked[1]]:.1f} vs {score[best]:.1f})"
+        if pick["CY"] and pick["PY"] and pick["CY"] != pick["PY"]:
+            note = f"AUTO - RENAMED? CY: {pick['CY']} / PY: {pick['PY']} - check"
+        return (pick["CY"], round(100 * hits["CY"].get(pick["CY"], 0) / n) if pick["CY"] else 0,
+                pick["PY"], round(100 * hits["PY"].get(pick["PY"], 0) / n) if pick["PY"] else 0, note)
+    return None, 0, None, 0, "NOT recognised"
+
+
+def _norm_fund(t):
+    return re.sub(r"\s+", " ", str(t or "")).strip().upper()
+
+
+def _resolve_fund(part, names):
+    """Fund map entry -> exactly one SOI fund name. Exact name first, then 'contains'.
+    Returns (name, error)."""
+    want = _norm_fund(part)
+    exact = [f for f in names if _norm_fund(f) == want]
+    if len(exact) == 1:
+        return exact[0], None
+    hits = sorted(f for f in names if want in _norm_fund(f))
+    if len(hits) == 1:
+        return hits[0], None
+    if not hits:
+        return None, f"'{part}' not found"
+    return None, f"'{part}' matches {len(hits)} funds ({'; '.join(hits[:3])})"
+
+
+def detect_funds_joint(ax, soi_cy, soi_py, cfg, log=print, fund_map=None):
+    """Alteryx Fund Id -> fund in SOI CY and SOI PY.
+    1) Fund map (data/funds_<client>.xlsx, plus legacy JSON "fund_map"): used as given - no guessing.
+       Automatic detection still runs as a check; a different suggestion is shown in the note.
+    2) Not in the map: automatic detection (_auto_detect).
+    Returns fmap_cy, fmap_py ({fid: (name, hit%)}) and notes ({fid: text for the Summary})."""
+    idx = {"CY": _soi_index(soi_cy), "PY": _soi_index(soi_py)}
+    names = {"CY": set(soi_cy["Fund"].dropna()) if soi_cy is not None and not soi_cy.empty else set(),
+             "PY": set(soi_py["Fund"].dropna()) if soi_py is not None and not soi_py.empty else set()}
+    fmap = {str(k): (v, None) for k, v in (cfg.get("fund_map") or {}).items()}  # legacy JSON: same name both years
+    fmap.update(fund_map or {})  # the fund map file wins
+    fmap_cy, fmap_py, notes = {}, {}, {}
+    for fid, rows in ax.groupby("fund_id"):
+        a_cy, h_cy, a_py, h_py, a_note = _auto_detect(rows, idx, names)
+        if fid not in fmap:
+            fmap_cy[fid], fmap_py[fid], notes[fid] = (a_cy, h_cy), (a_py, h_py), a_note
+            continue
+        cy_part, py_part = fmap[fid]
+        py_part = py_part or cy_part
+        res, errs, absent = {}, [], []
+        for yr, part in (("CY", cy_part), ("PY", py_part)):
+            if not names[yr]:  # that year's SOI not loaded
+                res[yr] = None
+                continue
+            res[yr], err = _resolve_fund(part, names[yr])
+            if err and "not found" in err:
+                absent.append(yr)  # new fund (no PY) or closed fund (no CY) - or a typo: shown, not an error
+            elif err:
+                errs.append(f"SOI {yr}: {err}")
+        n = len(rows)
+
+        def hit_pct(yr, f):
+            if not f:
+                return 0
+            return round(100 * sum(1 for _, r in rows.iterrows() if f in _funds_holding(r, idx[yr], True)) / n)
+        fmap_cy[fid], fmap_py[fid] = (res["CY"], hit_pct("CY", res["CY"])), (res["PY"], hit_pct("PY", res["PY"]))
+        if errs:
+            notes[fid] = "MAP ERROR - " + "; ".join(errs) + " - fix the fund map"
+            continue
+        differs = [f"{yr}: {a}" for yr, a, m in (("CY", a_cy, res["CY"]), ("PY", a_py, res["PY"])) if a and a != m]
+        if differs:
+            notes[fid] = "MAPPED - detection suggests " + " / ".join(differs) + " - check the fund map"
+        elif not (res["CY"] or res["PY"]):
+            notes[fid] = f"MAP ERROR - '{cy_part}' not found in any SOI - fix the fund map"
+        else:
+            notes[fid] = "MAPPED (detection agrees)" if (a_cy or a_py) else "MAPPED (detection found nothing)"
+        if absent and not notes[fid].startswith("MAP ERROR"):
+            notes[fid] += " | not in SOI " + "/".join(absent) + " (new or closed fund?)"
+    return fmap_cy, fmap_py, notes
+
+
+# ============================ FUND MAP FILE ============================
+FUND_MAP_COLS = ["Fund Id", "SOI Fund Name", "SOI Fund Name PY", "Base Currency", "Report Order",
+                 "Saved On", "Saved By", "Review File"]
+
+
+def load_fund_map(path):
+    """data/funds_<client>.xlsx -> {fund_id: (CY name or part, PY name or None)}."""
+    p = Path(path) if path else None
+    if not p or not p.exists():
+        return {}
+    df = pd.read_excel(p, dtype=str)
+    out = {}
+    for _, r in df.iterrows():
+        fid = _fid(r.get("Fund Id"))
+        cy = r.get("SOI Fund Name")
+        if not fid or _isna(cy) or not str(cy).strip():
+            continue
+        py = r.get("SOI Fund Name PY")
+        out[fid] = (str(cy).strip(), None if _isna(py) or not str(py).strip() else str(py).strip())
+    return out
+
+
+def save_fund_map(review_path, fund_map_path, log=print):
+    """Adds the funds DETECTED AUTOMATICALLY in a reviewed Review file (Summary sheet) to the fund map.
+    Mapped funds and funds with errors / not recognised are not touched. Returns (new, updated)."""
+    sm = pd.read_excel(review_path, sheet_name="Summary", dtype=str)
+    sm = sm.drop_duplicates(subset="Fund Id")
+    new = []
+    for _, r in sm.iterrows():
+        note = str(r.get("Fund Detection") or "")
+        if not note.startswith("AUTO"):
+            continue
+        cy, py = r.get("SOI CY"), r.get("SOI PY")
+        cy = None if _isna(cy) else str(cy).strip()
+        py = None if _isna(py) else str(py).strip()
+        if not (cy or py):
+            continue
+        new.append({"Fund Id": _fid(r["Fund Id"]), "SOI Fund Name": cy or py,
+                    "SOI Fund Name PY": py if (cy and py and py != cy) else None,
+                    "Saved On": datetime.now().strftime("%Y-%m-%d %H:%M"), "Saved By": _user(),
+                    "Review File": Path(review_path).name})
+    if not new:
+        log("Fund map: no automatically detected funds in this review file - nothing to save")
+        return 0, 0
+    new = pd.DataFrame(new)
+    mp = Path(fund_map_path)
+    old = pd.read_excel(mp, dtype=str) if mp.exists() else pd.DataFrame(columns=FUND_MAP_COLS)
+    if not old.empty:
+        old["Fund Id"] = [_fid(v) for v in old["Fund Id"]]
+        # Base Currency / Report Order are typed in by hand (used by the Word step) - keep them on update
+        for col in ("Base Currency", "Report Order"):
+            if col in old.columns:
+                keep = dict(zip(old["Fund Id"], old[col]))
+                new[col] = [keep.get(f) for f in new["Fund Id"]]
+    for col in ("Base Currency", "Report Order"):
+        if col not in new.columns:
+            new[col] = None
+    updated = int(old["Fund Id"].isin(new["Fund Id"]).sum()) if not old.empty else 0
+    out = pd.concat([old[~old["Fund Id"].isin(new["Fund Id"])] if not old.empty else old, new], ignore_index=True)
+    out = out[[c for c in FUND_MAP_COLS if c in out.columns] + [c for c in out.columns if c not in FUND_MAP_COLS]]
+    out = out.sort_values("Fund Id", key=lambda c: c.str.zfill(12)).reset_index(drop=True)
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(mp, engine="openpyxl") as xw:
+        out.to_excel(xw, sheet_name="Funds", index=False)
+        no_formulas(xw.book)
+        ws = xw.book["Funds"]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for col in ws.columns:
+            width = max(len(str(c.value)) if c.value is not None else 0 for c in col[:500])
+            ws.column_dimensions[col[0].column_letter].width = min(max(10, width + 2), 70)
+    renamed = int(new["SOI Fund Name PY"].notna().sum())
+    log(f"Fund map: {len(new) - updated} new, {updated} updated -> {mp} ({len(out)} funds in total)"
+        + (f"; {renamed} with a different PY name (renamed fund) - check them" if renamed else ""))
+    return len(new) - updated, updated
+
+
+# ============================ MATCHING ============================
+def match_debt_strict(row, s, cfg):
+    if s.empty or row["_dkey"] is None:
+        return None
+    s = s[(s["Type"] == "Debt") & (s["_dkey"] == row["_dkey"])]
+    if row["_zcp"]:
+        s = s[s["ZCP"] == True]  # noqa: E712
+    elif not row["_float"]:
+        s = s[s["Coupon"].sub(row["_coupon"]).abs() < 0.0005]
+    if s.empty:
+        return None
+    scores = [score_set(row["_issuer"], n) for n in s["_n"]]
+    # token_set gives 100 to any subset ('ABC LTD' vs 'ABC HOLDINGS LTD'), so break ties with token_sort
+    i = max(range(len(scores)), key=lambda k: (scores[k], score_sort(row["_issuer"], s["_n"].iloc[k])))
+    # another issuer within 5 points = we cannot be sure which bond it is
+    close = sum(1 for k, sc in enumerate(scores)
+                if k != i and sc >= scores[i] - 5 and s["_n"].iloc[k] != s["_n"].iloc[i])
+    return s.iloc[i], scores[i], len(s), close
+
+
+def is_perp_date(d):
+    return d is not None and not _isna(d) and getattr(d, "year", 0) >= 2070
+
+
+def match_debt_relaxed(row, s, cfg):
+    """Perpetuals only: same issuer, coupon equal (or FRN), but a different date (call date vs 2074 etc.).
+    Never used for ZCP/T-bills (a bill is identified by its maturity) and never when the issuer has
+    more than one candidate bond (we could not tell which one it is)."""
+    if s.empty or row["_zcp"]:
+        return None
+    row_perp = "PERP" in str(row.get("description", "")).upper() or is_perp_date(row["_maturity"])
+    s = s[(s["Type"] == "Debt") & (s["ZCP"] != True)]  # noqa: E712
+    if not row["_float"]:
+        s = s[s["Coupon"].sub(row["_coupon"]).abs() < 0.0005]
+    if s.empty:
+        return None
+    thr = cfg["matching"]["relaxed_issuer_score"]
+    hits = [(i, sc) for i, sc in enumerate(score_sort(row["_issuer"], n) for n in s["_n"]) if sc >= thr]
+    if len(hits) != 1:
+        return None
+    r, sc = s.iloc[hits[0][0]], hits[0][1]
+    if not (row_perp or is_perp_date(r["Maturity"])):
+        return None
+    return r, sc, 1
+
+
+def match_equity(row, s, cfg):
+    if s.empty:
+        return None
+    s = s[s["Type"] == "Equity"]
+    exact = s[s["_n"] == row["_issuer"]]
+    if not exact.empty:
+        return exact.iloc[0], 100, len(exact), "exact"
+    if s.empty:
+        return None
+    scores = [score_sort(row["_issuer"], n) for n in s["_n"]]
+    i = max(range(len(scores)), key=lambda k: scores[k])
+    if scores[i] >= cfg["matching"]["equity_fuzzy_score"]:
+        return s.iloc[i], scores[i], 1, "fuzzy"
+    return None
+
+
+def _wrap_check(r, st, notes):
+    """SOI name spread over 2+ lines in the PDF (joined by the parser) or a suspicious line just above it:
+    the published name may be cut or joined wrongly -> check by eye."""
+    prev = r.get("Check_prev_line")
+    if r.get("Wrapped") == True:  # noqa: E712
+        notes.append("name wrapped over 2+ lines in the SOI PDF - check it is complete")
+        return YELLOW if st == GREEN else st
+    if isinstance(prev, str) and prev.strip():
+        notes.append(f"SOI line above may be part of the name: '{prev.strip()}'")
+        return YELLOW if st == GREEN else st
+    return st
+
+
+def match_row(row, sources, cfg, mappings, externals=(), book=None):
+    """sources: list of (label, fund SOI dataframe) in cascade order; externals: list of ExternalSource."""
+    min_sc = cfg["matching"]["issuer_min_score"]
+    aid = norm_aid(row.get("asset_id"))
+    if aid and aid in mappings:
+        mname = mappings[aid]
+        base = match_row(row, sources, cfg, {}, externals, book)  # what the cascade would propose without mapping
+        notes, st = ["from mapping file (previously approved)"], GREEN
+        if base["src"] in ("SOI_CY", "SOI_PY") and base["name"] != mname:
+            st = YELLOW
+            notes.append(f"differs from {base['src']}: '{base['name']}' - check which one is correct")
+        if row["_kind"] == "Debt" and row["_float"]:
+            st = YELLOW
+            notes.append("FRN: coupon in the mapping is from an earlier period - check the current coupon")
+        cpn, zcp, mat = parse_name_parts(mname)
+        return dict(name=mname, src="MAPPING", method="Asset ID", score=None, status=st, note="; ".join(notes),
+                    soi_hold=base.get("soi_hold"), ref_cpn=cpn, ref_mat=mat)
+
+    if row["_kind"] == "Equity":
+        for label, s in sources:
+            m = match_equity(row, s, cfg)
+            if m:
+                r, sc, n, how = m
+                notes, st = [], GREEN
+                if how == "fuzzy":
+                    st = YELLOW
+                    notes.append("similar name, not identical")
+                if n > 1:
+                    st = YELLOW
+                    notes.append(f"{n} lines for this company in SOI (144A/share class?)")
+                if label != sources[0][0]:
+                    notes.append(f"found in {label} (fallback)")
+                st = _wrap_check(r, st, notes)
+                return dict(name=r["Name_publication"], src=label, method=f"name ({how})", score=round(sc),
+                            status=st, note="; ".join(notes), soi_hold=r.get("Holding"),
+                            ref_cpn=(0.0 if r.get("ZCP") == True else r.get("Coupon")), ref_mat=r.get("Maturity"))
+    else:
+        for label, s in sources:
+            m = match_debt_strict(row, s, cfg)
+            if m:
+                r, sc, n, close = m
+                notes, st = [], GREEN
+                if sc < min_sc:
+                    st = YELLOW
+                    notes.append(f"coupon+date match, weak issuer similarity ({round(sc)})")
+                if close:
+                    st = YELLOW
+                    notes.append(f"{close + 1} issuers with the same coupon+date and similar names - check which one")
+                elif n > 1 and sc < 100:
+                    notes.append(f"{n} candidates with the same date")
+                if row["_float"]:
+                    notes.append("coupon 0 in Alteryx (FRN/PERP) - coupon taken from SOI")
+                    if r.get("ZCP") == True:  # noqa: E712
+                        st = YELLOW
+                        notes.append("SOI shows ZCP - please check")
+                if label != sources[0][0]:
+                    notes.append(f"found in {label} (fallback)")
+                st = _wrap_check(r, st, notes)
+                return dict(name=r["Name_publication"], src=label, method="coupon+date+issuer", score=round(sc),
+                            status=st, note="; ".join(notes), soi_hold=r.get("Holding"),
+                            ref_cpn=(0.0 if r.get("ZCP") == True else r.get("Coupon")), ref_mat=r.get("Maturity"))
+        for label, s in sources:
+            m = match_debt_relaxed(row, s, cfg)
+            if m:
+                r, sc, _ = m
+                return dict(name=r["Name_publication"], src=label, method="issuer (different date)", score=round(sc),
+                            status=YELLOW, note="perpetual: SOI date differs from Alteryx - check which one is correct",
+                            soi_hold=r.get("Holding"),
+                            ref_cpn=(0.0 if r.get("ZCP") == True else r.get("Coupon")), ref_mat=r.get("Maturity"))
+
+    # --- external sources (Bloomberg, PVAL) ---
+    for ext in externals:
+        hit = ext.lookup(row, cfg)
+        if hit:
+            rec, how = hit
+            name, soi_sp, cpn, mat_used = name_from_external(row, rec, book, cfg)
+            notes = [f"not in SOI - name built from {ext.label} data (matched by {how})"]
+            notes.append("issuer spelling from SOI" if soi_sp else "issuer spelling NOT in SOI - check")
+            st = YELLOW
+            if row["_kind"] == "Debt" and row["_float"] and cpn is None:
+                st = RED
+                notes.append(f"{ext.label} has no coupon for this FRN - enter it")
+            return dict(name=name, src=ext.label, method=how, score=None, status=st,
+                        note="; ".join(notes), soi_hold=None, ext_rec=rec,
+                        ref_cpn=0.0 if (cpn is None and row["_zcp"]) else cpn, ref_mat=mat_used)
+
+    # --- last resort: rules from Alteryx ---
+    name, soi_sp = build_rule_name(row, cfg, book)
+    sp = "issuer spelling from SOI" if soi_sp else "issuer spelling from Alteryx"
+    note, st = f"not in SOI/Bloomberg/PVAL - name built from rules ({sp}), complete/verify", RED
+    if row["_kind"] == "Debt" and row["_float"]:
+        note = "FRN/PERP with coupon 0, not found in any source - enter the coupon"
+    elif row["_kind"] == "Debt" and row["_zcp"]:
+        note = f"ZCP/T-bill not in any SOI (bought and matured in the year) - own maturity from Alteryx, {sp}"
+        st = YELLOW
+    return dict(name=name, src="RULES", method="-", score=None, status=st, note=note, soi_hold=None,
+                ref_cpn=None if row["_float"] else row["_coupon"],
+                ref_mat=None if _isna(row["_maturity"]) else row["_maturity"])
+
+
+# ============================ EXTERNAL SOURCES (Bloomberg, PVAL) ============================
+ALIASES = {
+    "id": ["CUSIP", "ISIN", "SEDOL", "ASSET ID", "SECURITY ID", "SEC ID", "FIGI", "ID_BB", "PRIMARY ID", "IDENTIFIER"],
+    # LONG_COMP_NAME (Bloomberg) = full issuer name in normal casing - preferred over the short NAME
+    "name": ["ISSUER", "ISSUER NAME", "LONG_COMP_NAME", "COMPANY NAME", "NAME", "SECURITY NAME", "SECURITY_NAME",
+             "SECURITY DESCRIPTION", "DESCRIPTION", "SECURITY_DES", "ISSUE DESCRIPTION", "ASSET DESCRIPTION"],
+    "coupon": ["CPN", "COUPON", "COUPON RATE", "INTEREST RATE", "RATE"],
+    # MATURITY first, FINAL_MATURITY as fallback (used row by row when MATURITY is empty)
+    "maturity": ["MATURITY", "FINAL_MATURITY", "MATURITY DATE", "MATURITY_DATE", "MATURITY_DT", "FINAL MATURITY"],
+    # informative only (kind detection + backup sheet)
+    "info": ["SECURITY_DES", "MARKET_SECTOR_DES", "SECURITY_TYP", "CPN_TYP", "SECURITY TYPE", "ASSET TYPE",
+             "INDUSTRY_SECTOR", "144A_FLAG", "INVESTMENT TYPE", "ISSUE NAME", "COUPON TYPE CODE", "PROCESSING SECURITY TYPE",
+             "ACCOUNT", "ENTITY NAME"],
+}
+# ID-like headers that identify the COMPANY, not the security - never used for matching
+ID_EXCLUDE = ["COMPANY", "PARENT", "ULT_", "ULTIMATE", "ISSUER"]
+# "contains" matches that are NOT the wanted value (PVAL has 'Maturity Price' next to 'Maturity Date')
+KIND_EXCLUDE = {"maturity": ["PRICE", "YIELD", "VALUE", "AMOUNT"], "coupon": ["TYPE", "FREQ", "DATE"]}
+
+
+def _hdr(v):
+    return re.sub(r"\s+", " ", str(v or "").strip().upper())
+
+
+def _auto_cols(columns, kind, configured):
+    if configured:
+        return [c for c in columns if _hdr(c) in {_hdr(x) for x in configured}]
+    cols = [_hdr(c) for c in columns]
+    if kind == "id":
+        return [c for c, h in zip(columns, cols)
+                if (h == "ID" or any(a in h for a in ALIASES["id"])) and not any(x in h for x in ID_EXCLUDE)]
+    # exact alias first (in alias priority order), then "contains"
+    out = []
+    for a in ALIASES[kind]:
+        out += [c for c, h in zip(columns, cols) if h == a and c not in out]
+    if kind != "info":
+        excl = KIND_EXCLUDE.get(kind, [])
+        for a in ALIASES[kind]:
+            out += [c for c, h in zip(columns, cols) if a in h and c not in out and not any(x in h for x in excl)]
+    return out
+
+
+def _excel_engine():
+    """python-calamine reads big xlsx files ~10x faster than openpyxl (pip install python-calamine)."""
+    try:
+        import python_calamine  # noqa: F401
+        return "calamine"
+    except ImportError:
+        return None
+
+
+def _read_table(f, sc):
+    """Reads xlsx/xls/csv, finds the header row (exports may have title rows on top) and loads ONLY the
+    needed columns (ID, name, coupon, maturity, info) - the Bloomberg download has 100+ columns."""
+    is_csv = f.suffix.lower() == ".csv"
+    eng = None if is_csv else _excel_engine()
+    raw = pd.read_csv(f, header=None, nrows=40, dtype=str) if is_csv \
+        else pd.read_excel(f, header=None, nrows=40, engine=eng)
+    hdr_row = 0
+    for i, r in raw.iterrows():
+        vals = [_hdr(v) for v in r.tolist()]
+        has_id = any(v == "ID" or any(a in v for a in ALIASES["id"]) for v in vals)
+        has_name = any(any(a in v for a in ALIASES["name"]) for v in vals)
+        if has_id and has_name:
+            hdr_row = i
+            break
+    header = [c for c in raw.iloc[hdr_row].tolist() if not _isna(c)]
+    cols = {k: _auto_cols(header, k, sc.get(f"{k}_columns")) for k in ("id", "name", "coupon", "maturity")}
+    cols["info"] = _auto_cols(header, "info", None)
+    needed = list(dict.fromkeys(c for k in cols for c in cols[k]))
+    if is_csv:
+        t = pd.read_csv(f, header=hdr_row, usecols=lambda c: c in needed, dtype=str)
+    else:
+        t = pd.read_excel(f, header=hdr_row, usecols=lambda c: c in needed, engine=eng,
+                          dtype={c: str for c in cols["id"]})
+    return t, cols
+
+
+MONTHS = {m: i for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT",
+                                        "NOV", "DEC"], start=1)}
+
+
+def file_period(f):
+    """Sort key for monthly files: date in the file name (2025_12, 12-2025, Dec2025,
+    '01. January 2025_Bloomberg Monthly Download'), otherwise the file's modification time."""
+    n = f.stem.upper()
+    m = re.search(r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*[-_ .]?(20\d{2}|\d{2})(?!\d)", n)
+    if m:
+        y = int(m.group(2))
+        return (0, y + 2000 if y < 100 else y, MONTHS[m.group(1)], f.name)
+    m = re.search(r"(20\d{2})[-_ .]?(0[1-9]|1[0-2])(?!\d)", n)
+    if m:
+        return (0, int(m.group(1)), int(m.group(2)), f.name)
+    m = re.search(r"(?<!\d)(0[1-9]|1[0-2])[-_ .]?(20\d{2})", n)
+    if m:
+        return (0, int(m.group(2)), int(m.group(1)), f.name)
+    return (1, f.stat().st_mtime, 0, f.name)
+
+
+def to_coupon(v):
+    """5.125 / '5.125%' / '5 1/8' -> 5.125 ; 'N.A.' -> None"""
+    if _isna(v):
+        return None
+    t = str(v).replace("%", "").strip()
+    m = re.fullmatch(r"(\d+)\s+(\d+)/(\d+)", t)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / int(m.group(3))
+    return to_float(t)
+
+
+def clean_ext_name(text, cfg):
+    if _isna(text) or str(text).strip().upper() in ("N.A.", "N/A", "#N/A"):
+        return ""
+    return clean_issuer_text(text, cfg)
+
+
+def _clean_id(v, header):
+    """Excel turns IDs into numbers: CUSIP 000360206 -> 360206, SEDOL 0263494 -> 263494, 00091E109 -> 9.1E+110."""
+    if _isna(v):
+        return ""
+    t = str(v).strip().upper()
+    if t in ("", "NAN", "NONE", "N.A.", "N/A", "#N/A"):
+        return ""
+    t = t[:-2] if t.endswith(".0") else t
+    if "E+" in t:  # scientific notation - the real ID is lost; ISIN still covers it
+        return ""
+    h = _hdr(header)
+    if t.isdigit():
+        if "CUSIP" in h and len(t) < 9:
+            t = t.zfill(9)
+        elif "SEDOL" in h and len(t) < 7:
+            t = t.zfill(7)
+    return t
+
+
+class ExternalSource:
+    """Bloomberg / PVAL. Accepts one file or a folder (e.g. 12 monthly Bloomberg downloads).
+    Each file is read separately with only the needed columns, files are merged and duplicates removed -
+    the most recent file wins. Slim copies are cached in cache_dir, so the next run is fast."""
+
+    def __init__(self, label, path, cfg, log=print, cache_dir=None):
+        self.label = label
+        sc = cfg["external_sources"].get(label, {})
+        us = sc.get("maturity_us_format", True)
+        p = Path(path)
+        files = [f for f in p.iterdir() if f.suffix.lower() in (".xlsx", ".xlsm", ".xls", ".csv")
+                 and not f.name.startswith("~$")] if p.is_dir() else [p]
+        files.sort(key=file_period)  # oldest -> newest
+        drop = set(cfg["matching"]["drop_tokens"]) | set(cfg["name_format"]["strip_suffixes"])
+        cache = Path(cache_dir) if cache_dir else None
+        if cache:
+            cache.mkdir(parents=True, exist_ok=True)
+
+        recs, raw_rows, detected = [], 0, None
+        for n_f, f in enumerate(files, start=1):
+            st = f.stat()
+            # cache key = file (name, date, size) + which columns the CODE/PROFILE asks for, so a new code version
+            # (e.g. a newly used column like 144A_FLAG) automatically ignores old cache files
+            sig = hashlib.md5(json.dumps([ALIASES, ID_EXCLUDE, sc], sort_keys=True, default=str).encode()).hexdigest()[:8]
+            # Cache = plain text files (gzipped CSV + JSON with the detected columns) - no executable formats.
+            base = cache / f"{label}_{f.stem}_{int(st.st_mtime)}_{st.st_size}_{sig}" if cache else None
+            ck, cj = (Path(f"{base}.csv.gz"), Path(f"{base}.json")) if base else (None, None)
+            if ck and ck.exists() and cj.exists():
+                t = pd.read_csv(ck, dtype=str)
+                cols = json.loads(cj.read_text(encoding="utf-8"))
+                how = "cache"
+            else:
+                t, cols = _read_table(f, sc)
+                how = "read"
+                if ck:
+                    t.to_csv(ck, index=False)
+                    cj.write_text(json.dumps({k: [str(c) for c in v] for k, v in cols.items()}), encoding="utf-8")
+                    t.columns = [str(c) for c in t.columns]
+                    cols = {k: [str(c) for c in v] for k, v in cols.items()}
+            log(f"{label}: [{n_f}/{len(files)}] {f.name} - {len(t)} rows ({how})")
+            raw_rows += len(t)
+            if not cols["name"]:
+                raise ValueError(f"{label} / {f.name}: no name/description column found - "
+                                 f"set external_sources.{label}.name_columns in the client JSON")
+            name_c, cpn_c = cols["name"][0], (cols["coupon"][0] if cols["coupon"] else None)
+            mat_cs = cols["maturity"]
+            sector_c = next((c for c in cols["info"] if _hdr(c) in ("MARKET_SECTOR_DES", "INVESTMENT TYPE")), None)
+            if detected is None:
+                detected = (cols["id"], name_c, cpn_c, mat_cs)
+            for _, r in t.iterrows():
+                raw_name = r[name_c]
+                name = clean_ext_name(raw_name, cfg)
+                if not name:
+                    continue
+                cpn = to_coupon(r[cpn_c]) if cpn_c else None
+                mat = None
+                for mc in mat_cs:  # MATURITY, then FINAL_MATURITY
+                    mat = to_date(r[mc], us)
+                    if mat is not None:
+                        break
+                ids, id_txt = set(), []
+                for c in cols["id"]:
+                    v = _clean_id(r[c], c)
+                    if v:
+                        ids.add(v)
+                        id_txt.append(f"{c}={v}")
+                        if len(v) == 12 and v[:2].isalpha():   # ISIN -> CUSIP (chars 3-11) / SEDOL (chars 5-11)
+                            ids.update({v[2:11], v[4:11], v[2:10]})  # + 8-char CUSIP without check digit
+                        elif len(v) == 9 and "CUSIP" in _hdr(c):
+                            ids.add(v[:8])
+                sector = str(r[sector_c]).strip().upper() if sector_c and not _isna(r[sector_c]) else ""
+                if sector:  # Bloomberg MARKET_SECTOR_DES (Equity/Corp/Govt) or PVAL Investment Type (FI/EQ)
+                    kind = "Equity" if (sector.startswith("EQ") or sector in ("PFD", "COMMON STOCK")) else "Debt"
+                else:
+                    kind = "Debt" if (mat is not None or (cpn or 0) > 0) else "Equity"
+                info = "; ".join(f"{c}={r[c]}" for c in cols["info"] if not _isna(r[c]))
+                recs.append({"_ids": ids, "Issuer": name, "_n": norm(name, drop), "Type": kind, "Coupon": cpn,
+                             "Maturity": mat, "_dkey": dkey(mat), "ZCP": kind == "Debt" and (cpn == 0),
+                             "Name_publication": None, "Holding": None,
+                             # kept for the backup sheet in the review file
+                             "_file": f.name, "_ids_txt": "; ".join(id_txt), "_name_raw": raw_name,
+                             "_cpn_raw": r[cpn_c] if cpn_c else None,
+                             "_mat_raw": mat.strftime("%d/%m/%Y") if mat is not None else None,
+                             "_info": info,
+                             "_144a": any(_hdr(c) == "144A_FLAG" and str(r[c]).strip().upper() in ("Y", "YES", "TRUE", "1")
+                                          for c in cols["info"] if not _isna(r[c]))})
+        df = pd.DataFrame(recs)
+        if not df.empty:  # de-duplicate across months: same IDs (or same name+coupon+maturity) -> keep newest
+            df["_key"] = [("ID", tuple(sorted(i))) if i else ("NM", n, c, str(m))
+                          for i, n, c, m in zip(df["_ids"], df["_n"], df["Coupon"], df["Maturity"])]
+            df = df.drop_duplicates(subset="_key", keep="last").reset_index(drop=True)
+        self.df = df
+        self.index = {}
+        for i, ids in enumerate(df["_ids"] if not df.empty else []):
+            for v in ids:
+                self.index[v] = i  # later (newer) rows overwrite older ones
+        d = detected or ([], None, None, [])
+        log(f"{label}: {len(files)} file(s), {raw_rows} rows -> {len(df)} unique securities | ID cols {d[0]} | "
+            f"name '{d[1]}' | coupon '{d[2]}' | maturity {d[3]}")
+
+    def _find(self, row):
+        """Index position by Asset ID; all-digit IDs also with the zeros Excel removed (SEDOL 7, CUSIP 9)."""
+        aid = norm_aid(row.get("asset_id"))
+        if not aid:
+            return None
+        for v in ([aid, aid.zfill(7), aid.zfill(9)] if aid.isdigit() else [aid]):
+            if v in self.index:
+                return self.index[v]
+        return None
+
+    def by_id(self, row):
+        i = self._find(row)
+        return None if i is None else self.df.iloc[i]
+
+    def lookup(self, row, cfg):
+        """1) by Asset ID (also inside ISIN), 2) by coupon+date+issuer / equity name. Returns (record, how)."""
+        i = self._find(row)
+        if i is not None:
+            return self.df.iloc[i], "Asset ID"
+        if self.df.empty:
+            return None
+        if row["_kind"] == "Equity":
+            m = match_equity(row, self.df, cfg)
+            return (m[0], "name") if m and m[1] >= cfg["matching"]["equity_fuzzy_score"] else None
+        m = match_debt_strict(row, self.df, cfg)
+        if m and m[1] >= cfg["matching"]["issuer_min_score"]:
+            return m[0], "coupon+date+issuer"
+        return None
+
+
+def name_from_external(row, rec, book, cfg):
+    """SOI-format name from external data; issuer spelling from SOI when the issuer exists there."""
+    drop = set(cfg["matching"]["drop_tokens"]) | set(cfg["name_format"]["strip_suffixes"])
+    kind = row["_kind"]
+    soi_sp = book.spell(norm(rec["Issuer"], drop), kind) or book.spell(row["_issuer"], kind)
+    # Issuer: SOI spelling > source spelling if it has proper casing (e.g. 'BlackBuck Ltd') > Alteryx issuer in
+    # Title Case (Bloomberg short names like 'BANGKOK BANK PCL/HK' are abbreviated; Alteryx has the full name).
+    # Coupon and maturity come from the source.
+    if soi_sp:
+        issuer = soi_sp
+    elif rec["Issuer"] != rec["Issuer"].upper():
+        issuer = rec["Issuer"]
+    else:
+        issuer = title_name(row["_issuer_raw"], cfg)
+    flag144 = rec.get("_144a") == True and kind in cfg["name_format"].get("append_144a_for", [])  # noqa: E712
+    sfx = ""
+    if kind == "Equity":
+        if flag144 and "144A" not in issuer.upper().split():
+            issuer = f"{issuer} 144A"
+    else:
+        issuer, had = _split_144a(issuer)
+        sfx = "144A" if (flag144 or (had and "Debt" in cfg["name_format"].get("append_144a_for", []))) else ""
+    mat = rec["Maturity"] if rec["Maturity"] is not None and not _isna(rec["Maturity"]) else \
+        (None if _isna(row["_maturity"]) else row["_maturity"])
+    cpn = rec["Coupon"] if rec["Coupon"] is not None and not _isna(rec["Coupon"]) else \
+        (None if row["_float"] else row["_coupon"])
+    zcp = row["_zcp"] or (kind == "Debt" and cpn == 0 and not row["_float"])
+    if row["_float"] and cpn == 0:
+        cpn = None  # FRN must not become ZCP
+    return format_name(issuer, kind, cpn, mat, zcp, cfg, sfx), soi_sp is not None, cpn, mat
+
+
+def _same_date(a, b):
+    try:
+        return (a.day, a.month, a.year) == (b.day, b.month, b.year)
+    except AttributeError:
+        return True
+
+
+def issuer_of_name(name):
+    """Issuer part of a proposed name: 'Meituan, 5.125%, 05/11/35' -> 'Meituan';
+    'United States Treasury Bill ZCP, 02/01/26' -> 'United States Treasury Bill'; equity -> the name."""
+    t = str(name or "").strip()
+    m = re.match(r"^(.*?)(?:,\s*(?:\d+(?:\.\d+)?|\[COUPON\?\])%|\s+ZCP)\s*,", t)
+    t = m.group(1) if m else t
+    return _split_144a(t)[0]
+
+
+XC_OK, XC_DIFF, XC_NOT = "OK", "DIFF", "NOT CHECKED"
+XC_PHRASES = {"UNITED STATES": "US", "HONG KONG": "HK", "UNITED KINGDOM": "UK"}
+
+
+def xc_name_score(a, b):
+    """Issuer similarity for the cross-check, tolerant of abbreviations and truncated names
+    (PVAL cuts descriptions: 'GREAT EASTERN LIFE ASSUR' = 'Great Eastern Life Assurance')."""
+    for k, v in XC_PHRASES.items():
+        a, b = a.replace(k, v), b.replace(k, v)
+    ta, tb = a.split(), b.split()
+
+    def expand(src, full):  # 'ASSUR' -> 'ASSURANCE' when 'ASSURANCE' is in the other name
+        out = []
+        for i, t in enumerate(src):
+            hit = next((f for f in full if f != t and f.startswith(t) and (len(t) >= 4 or i == len(src) - 1)), None)
+            out.append(hit or t)
+        return " ".join(out)
+    return score_set(expand(ta, tb), expand(tb, ta))
+
+
+def cross_check(row, res, externals, cfg):
+    """Compares the proposed name with Bloomberg and PVAL, matched by Asset ID:
+      - issuer name (debt and equity): similarity below matching.crosscheck_name_score -> difference
+      - coupon (debt, not FRN) and maturity (debt; perpetuals: info only)
+    The source the name was built from is not compared with itself.
+    Returns (columns, differences, infos, label) where label is the 'Cross-check' cell:
+      'OK (BBG, PVAL)' / 'DIFF: ...' / 'NOT CHECKED: <reason>' (+ notes on what was not compared)."""
+    cols, diffs, infos, checked, notes = {}, [], [], [], []
+    ref_cpn, ref_mat = res.get("ref_cpn"), res.get("ref_mat")
+    ref_mat = None if _isna(ref_mat) else ref_mat
+    debt = row["_kind"] == "Debt"
+    perp = "PERP" in str(row.get("description", "")).upper() or is_perp_date(row["_maturity"]) \
+        or is_perp_date(ref_mat)
+    drop = set(cfg["matching"]["drop_tokens"]) | set(cfg["name_format"]["strip_suffixes"])
+    thr = cfg["matching"].get("crosscheck_name_score", 75)
+    prop_issuer = norm(issuer_of_name(res.get("name")), drop)
+    self_only = False
+    for ext in externals:
+        short = {"BLOOMBERG": "BBG"}.get(ext.label, ext.label)
+        rec = ext.by_id(row)
+        e_cpn = None if rec is None or _isna(rec["Coupon"]) else rec["Coupon"]
+        e_mat = None if rec is None or _isna(rec["Maturity"]) else rec["Maturity"]
+        cols[f"{short} Coupon"] = e_cpn if debt else None
+        cols[f"{short} Maturity"] = e_mat.strftime("%d/%m/%Y") if (debt and e_mat is not None) else None
+        if rec is None:
+            continue
+        if res.get("src") == ext.label:
+            self_only = True  # name built from this source - comparing it with itself proves nothing
+            continue
+        checked.append(short)
+        e_issuer = norm(rec["Issuer"], drop)
+        if prop_issuer and e_issuer:
+            sc = xc_name_score(prop_issuer, e_issuer)
+            if sc < thr:
+                diffs.append(f"issuer '{issuer_of_name(res.get('name'))}' vs {short} '{rec['Issuer']}' (score {round(sc)})")
+        if not debt:
+            continue
+        if row["_float"]:
+            if "FRN: coupon not compared" not in notes:
+                notes.append("FRN: coupon not compared")
+        elif ref_cpn is not None and e_cpn is not None and abs(float(ref_cpn) - float(e_cpn)) > 0.0005:
+            diffs.append(f"coupon {ref_cpn:g} vs {short} {e_cpn:g}")
+        if ref_mat is not None and e_mat is not None and not _same_date(ref_mat, e_mat):
+            msg = f"maturity {ref_mat:%d/%m/%y} vs {short} {e_mat:%d/%m/%y}"
+            (infos if perp else diffs).append(msg)  # perpetuals: call date vs 2074 etc. -> info only
+
+    if diffs:
+        label = "DIFF: " + ", ".join(diffs)
+    elif checked:
+        label = f"OK ({', '.join(checked)})"
+    elif not externals:
+        label = "NOT CHECKED: no Bloomberg/PVAL file loaded"
+    elif not norm_aid(row.get("asset_id")):
+        label = "NOT CHECKED: no Asset ID"
+    elif self_only:
+        label = f"NOT CHECKED: name built from {res.get('src')}, no second source has this Asset ID"
+    else:
+        label = "NOT CHECKED: Asset ID not in " + "/".join({"BLOOMBERG": "Bloomberg"}.get(e.label, e.label)
+                                                         for e in externals)
+    if notes and checked:
+        label += " - " + "; ".join(notes)
+    if infos:
+        label += " (perpetual, info: " + ", ".join(infos) + ")"
+    return cols, diffs, infos, label
+
+
+# ============================ MAPPINGS ============================
+MAP_COLS = ["Asset ID", "Name", "Alteryx Description", "Previous Proposed Name", "Fund Id", "Saved On", "Saved By",
+            "Review File"]
+
+
+def norm_aid(v):
+    """Asset ID as clean text (Excel may turn 6100186 into 6100186.0)."""
+    if _isna(v):
+        return ""
+    t = str(v).strip().upper()
+    return t[:-2] if t.endswith(".0") else t
+
+
+def parse_name_parts(name):
+    """'Meituan, 5.125%, 05/11/35' -> (5.125, False, date); 'X ZCP, 29/04/25' -> (0.0, True, date)."""
+    m = re.search(r"(?:,\s*(\d+(?:\.\d+)?)%|\s+ZCP)\s*,\s*(\d{2})/(\d{2})/(\d{2})(?:\s+144A)?\s*$", str(name or ""))
+    if not m:
+        return None, False, None
+    try:
+        d = datetime(2000 + int(m.group(4)), int(m.group(3)), int(m.group(2)))
+    except ValueError:
+        d = None
+    return (float(m.group(1)) if m.group(1) else 0.0), m.group(1) is None, d
+
+
+def load_mappings(path):
+    """Columns A (Asset ID) and B (Name); other columns are only for audit."""
+    p = Path(path) if path else None
+    if not p or not p.exists():
+        return {}
+    df = pd.read_excel(p, dtype=str)
+    return {norm_aid(a): str(n).strip() for a, n in zip(df.iloc[:, 0], df.iloc[:, 1])
+            if norm_aid(a) and not _isna(n) and str(n).strip()}
+
+
+def _user():
+    """Windows login of the person saving (audit trail in the mapping file)."""
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 - audit info only, never block saving
+        return ""
+
+
+def save_mappings(review_path, mappings_path, log=print):
+    """Saves MANUALLY CHANGED names (Final Name != Proposed Name) from a reviewed Review file.
+    Existing entries for the same Asset ID are replaced. Returns (new, updated)."""
+    rv = pd.read_excel(review_path, sheet_name="Review", dtype=str)
+    fin = rv["Final Name"].fillna("").str.strip()
+    prop = rv["Proposed Name"].fillna("").str.strip()
+    ch = rv[(fin != "") & (fin != prop) & rv["Asset ID"].notna()].copy()
+    ch["Final Name"] = fin[ch.index]
+    if ch.empty:
+        log("Mappings: no manually changed names in this review file - nothing to save")
+        return 0, 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    new = pd.DataFrame({
+        "Asset ID": [norm_aid(a) for a in ch["Asset ID"]], "Name": ch["Final Name"],
+        "Alteryx Description": ch.get("Alteryx Description"), "Previous Proposed Name": ch["Proposed Name"],
+        "Fund Id": ch.get("Fund Id"), "Saved On": now, "Saved By": _user(), "Review File": Path(review_path).name,
+    }).drop_duplicates(subset="Asset ID", keep="last")
+    mp = Path(mappings_path)
+    old = pd.read_excel(mp, dtype=str) if mp.exists() else pd.DataFrame(columns=MAP_COLS)
+    if not old.empty:
+        old["Asset ID"] = [norm_aid(a) for a in old.iloc[:, 0]]
+    updated = int(old["Asset ID"].isin(new["Asset ID"]).sum()) if not old.empty else 0
+    out = pd.concat([old[~old["Asset ID"].isin(new["Asset ID"])] if not old.empty else old, new],
+                    ignore_index=True)
+    out = out[[c for c in MAP_COLS if c in out.columns] + [c for c in out.columns if c not in MAP_COLS]]
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(mp, engine="openpyxl") as xw:
+        out.to_excel(xw, sheet_name="Mappings", index=False)
+        no_formulas(xw.book)
+        ws = xw.book["Mappings"]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for col in ws.columns:
+            width = max(len(str(c.value)) if c.value is not None else 0 for c in col[:500])
+            ws.column_dimensions[col[0].column_letter].width = min(max(10, width + 2), 70)
+    log(f"Mappings: {len(new) - updated} new, {updated} updated -> {mp} ({len(out)} entries in total)")
+    return len(new) - updated, updated
+
+
+def run_matching(alteryx_folder, soi_cy_df, soi_py_df, profile, out_path, mappings_path=None, log=print,
+                 external_paths=None, cache_dir=None, fund_map_path=None):
+    """external_paths: {"BLOOMBERG": file_or_folder, "PVAL": file_or_folder} (optional).
+    fund_map_path: data/funds_<client>.xlsx (optional) - Fund Id -> SOI fund name (CY, and PY if renamed)."""
+    cfg = merge_profile(profile)
+    ax_rows, ax_raw = read_alteryx_folder(alteryx_folder, cfg, log)
+    ax = enrich_alteryx(ax_rows, cfg)
+    log(f"Alteryx: {ax['fund_id'].nunique()} fund(s), {len(ax)} rows")
+    soi = {"SOI_CY": prep_soi(soi_cy_df, cfg), "SOI_PY": prep_soi(soi_py_df, cfg)}
+    mappings = load_mappings(mappings_path)
+    book = IssuerBook([soi["SOI_CY"], soi["SOI_PY"]])
+    externals = []
+    for label in cfg["external_order"]:
+        path = (external_paths or {}).get(label)
+        if path:
+            externals.append(ExternalSource(label, path, cfg, log, cache_dir=cache_dir))
+
+    fund_map = load_fund_map(fund_map_path)
+    if fund_map:
+        log(f"Fund map: {len(fund_map)} fund(s) from {Path(fund_map_path).name}")
+    fmap_cy, fmap_py, fund_notes = detect_funds_joint(ax, soi["SOI_CY"], soi["SOI_PY"], cfg, log, fund_map)
+    for fid in sorted(fmap_cy):
+        note = fund_notes.get(fid, "")
+        log(f"Fund {fid}: CY -> {fmap_cy[fid][0]} ({fmap_cy[fid][1]}%) | PY -> {fmap_py[fid][0]} ({fmap_py[fid][1]}%)"
+            f" | {note}")
+        if note.startswith(("MAP ERROR", "MAPPED - detection suggests", "AUTO - AMBIGUOUS", "AUTO - RENAMED")) \
+                or "new or closed fund" in note:
+            log(f"  WARNING: fund {fid}: {note}")
+        elif fmap_cy[fid][0] is None and fmap_py[fid][0] is None:
+            log(f"  WARNING: fund {fid} NOT recognised in SOI CY/PY - check the PDFs or add it to the fund map")
+
+    out_rows, used_ext = [], {}
+    for _, row in ax.iterrows():
+        fid = row["fund_id"]
+        subsets = {}
+        for key, fmap in (("SOI_CY", fmap_cy), ("SOI_PY", fmap_py)):
+            fname = fmap[fid][0]
+            s = soi[key]
+            subsets[key] = s[s["Fund"] == fname] if fname is not None and not s.empty else s.iloc[0:0]
+        order = cfg["matching"]["purchases_order" if row["side"] == "Purchases" else "sales_order"]
+        sources = [(k, subsets[k]) for k in order if k in subsets]
+        res = match_row(row, sources, cfg, mappings, externals, book)
+        if res.get("ext_rec") is not None:
+            r_ = res["ext_rec"]
+            used_ext.setdefault(res["src"], []).append({
+                "Fund Id": fid, "Side": row["side"], "No": row["order"], "Asset ID": row.get("asset_id"),
+                "Alteryx Description": row["description"], "Matched By": res["method"],
+                "Source File": r_["_file"], "IDs": r_["_ids_txt"], "Name (raw)": r_["_name_raw"],
+                "Coupon (raw)": r_["_cpn_raw"], "Maturity": r_["_mat_raw"], "Type / Sector": r_["_info"],
+                "Proposed Name": res["name"]})
+        xcols, xdiffs, xinfos, xlabel = cross_check(row, res, externals, cfg)
+        if xdiffs:
+            if res["status"] == GREEN:
+                res["status"] = YELLOW
+            res["note"] = (res["note"] + "; " if res["note"] else "") + "CROSS-CHECK: " + ", ".join(xdiffs)
+        xcols["Cross-check"] = xlabel
+        mat = None if _isna(row["_maturity"]) else row["_maturity"]
+        out_rows.append({
+            "Fund Id": fid,
+            "SOI Fund": fmap_cy[fid][0] or fmap_py[fid][0],
+            "Side": row["side"], "No": row["order"],
+            "Asset ID": row.get("asset_id"), "Alteryx Description": row["description"], "Type": row["_kind"],
+            "Coupon": row["_coupon"] if row["_kind"] == "Debt" else None,
+            "Maturity": mat.strftime("%d/%m/%Y") if mat is not None else None,
+            "Nominal": to_float(row["nominal"]), "Amount": to_float(row["amount"]),
+            "Proposed Name": res["name"], "Source": res["src"], "Method": res["method"],
+            "Issuer Score": res["score"], "SOI Holding": res["soi_hold"], "Comments": res["note"],
+            **xcols,
+            "Status": res["status"], "Final Name": res["name"],
+        })
+    rv = pd.DataFrame(out_rows)
+    if rv.empty:
+        raise ValueError("No Alteryx rows to match (all rows skipped - see warnings above).")
+
+    # duplicates: two rows -> same name
+    dup = rv.duplicated(subset=["Fund Id", "Side", "Proposed Name"], keep=False)
+    for i in rv.index[dup]:
+        rv.at[i, "Status"] = YELLOW if rv.at[i, "Status"] == GREEN else rv.at[i, "Status"]
+        rv.at[i, "Comments"] = (rv.at[i, "Comments"] + "; " if rv.at[i, "Comments"] else "") + "DUPLICATE name within fund"
+
+    write_review(rv, ax_raw, fmap_cy, fmap_py, out_path, used_ext, fund_notes)
+    cnt = rv["Status"].value_counts().to_dict()
+    log(f"Status: green {cnt.get(GREEN, 0)} | yellow {cnt.get(YELLOW, 0)} | red {cnt.get(RED, 0)}")
+    log(f"Review saved: {out_path}")
+    return rv
+
+
+# ============================ REVIEW EXCEL ============================
+def no_formulas(book):
+    """openpyxl writes any text starting with '=' as a formula. Text from Alteryx/Bloomberg/PVAL must stay text."""
+    for ws in book.worksheets:
+        for row in ws.iter_rows():
+            for c in row:
+                if c.data_type == "f":
+                    c.data_type = "s"
+
+def write_review(rv, ax, fmap_cy, fmap_py, out_path, used_ext=None, fund_notes=None):
+    """ax = RAW Alteryx rows (incl. rows without description) for the Completeness Check."""
+    summ = []
+    # every fund/side present in Alteryx - also one whose rows were ALL skipped (no description)
+    keys = sorted(set(zip(rv["Fund Id"], rv["Side"])) | set(zip(ax["fund_id"], ax["side"])))
+    for fid, side in keys:
+        a = ax[(ax["fund_id"] == fid) & (ax["side"] == side)]
+        g = rv[(rv["Fund Id"] == fid) & (rv["Side"] == side)]
+        cy, py = fmap_cy.get(fid, (None, 0)), fmap_py.get(fid, (None, 0))
+        summ.append({
+            "Fund Id": fid, "Side": side,
+            "SOI CY": cy[0], "CY Hit %": cy[1],
+            "SOI PY": py[0], "PY Hit %": py[1],
+            "Fund Detection": (fund_notes or {}).get(fid, ""),
+            "Alteryx Rows": len(a), "Review Rows": len(g),
+            # amounts that are filled in but are not numbers would count as 0 on BOTH sides - flag them
+            "Unreadable Amounts": int(sum(1 for v in a["amount"] if not _isna(v) and str(v).strip()
+                                          and to_float(v) is None)),
+            "Alteryx Total": a["amount"].apply(to_float).sum(), "Review Total": g["Amount"].sum(),
+            "Green": (g["Status"] == GREEN).sum(), "Yellow": (g["Status"] == YELLOW).sum(),
+            "Red": (g["Status"] == RED).sum(),
+            "From SOI": g["Source"].isin(["SOI_CY", "SOI_PY"]).sum(),
+            "From Mapping": (g["Source"] == "MAPPING").sum(),
+            "From Bloomberg": (g["Source"] == "BLOOMBERG").sum(),
+            "From PVAL": (g["Source"] == "PVAL").sum(),
+            "From Rules": (g["Source"] == "RULES").sum(),
+            "Cross-check OK": g["Cross-check"].astype(str).str.startswith(XC_OK).sum(),
+            "Cross-check Diff": g["Cross-check"].astype(str).str.startswith(XC_DIFF).sum(),
+            "Cross-check Not Checked": g["Cross-check"].astype(str).str.startswith(XC_NOT).sum(),
+        })
+    summ = pd.DataFrame(summ)
+    summ["Completeness Check"] = [
+        "OK" if r["Alteryx Rows"] == r["Review Rows"] and abs(r["Alteryx Total"] - r["Review Total"]) < 1
+        and r["Unreadable Amounts"] == 0 else "DIFFERENCE" for _, r in summ.iterrows()]
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+        summ.to_excel(xw, sheet_name="Summary", index=False)
+        rv.to_excel(xw, sheet_name="Review", index=False)
+        # backup: only the Bloomberg / PVAL rows that were actually used, with their raw values
+        for label in sorted(used_ext or {}, key=lambda x: ["BLOOMBERG", "PVAL"].index(x) if x in ("BLOOMBERG", "PVAL") else 9):
+            sheet = {"BLOOMBERG": "Bloomberg"}.get(label, label) + " Used"
+            pd.DataFrame(used_ext[label]).to_excel(xw, sheet_name=sheet[:31], index=False)
+        no_formulas(xw.book)  # before our own formula column is added
+        ws = xw.book["Review"]
+        hdr = {c.value: c.column for c in ws[1]}
+        st_col, prop_col, fin_col = hdr["Status"], hdr["Proposed Name"], hdr["Final Name"]
+        chg_col = ws.max_column + 1
+        ws.cell(row=1, column=chg_col, value="Manually Changed")
+        pl, fl = get_column_letter(prop_col), get_column_letter(fin_col)
+        for r in range(2, ws.max_row + 1):
+            ws.cell(row=r, column=chg_col, value=f'=IF({fl}{r}<>{pl}{r},"YES","")')
+            fill = FILLS.get(ws.cell(row=r, column=st_col).value)
+            if fill:
+                ws.cell(row=r, column=st_col).fill = fill
+                ws.cell(row=r, column=fin_col).fill = fill
+        for c in ws[1]:
+            c.font = Font(bold=True)
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.cell(row=1, column=fin_col).fill = PatternFill("solid", fgColor="BDD7EE")
+        for name in ("Nominal", "Amount", "SOI Holding"):
+            for r in range(2, ws.max_row + 1):
+                ws.cell(row=r, column=hdr[name]).number_format = "#,##0"
+        for wsx in xw.book.worksheets:
+            wsx.freeze_panes = "A2"
+            wsx.auto_filter.ref = wsx.dimensions
+            for col in wsx.columns:
+                width = max(len(str(c.value)) if c.value is not None else 0 for c in col[:200])
+                wsx.column_dimensions[col[0].column_letter].width = min(max(9, width + 2), 60)
+        ws2 = xw.book["Summary"]
+        for r in range(2, ws2.max_row + 1):
+            c = ws2.cell(row=r, column=ws2.max_column)
+            c.fill = FILLS[GREEN] if c.value == "OK" else FILLS[RED]
+
+
+# ============================ CLI ============================
+def main():
+    import tkinter as tk
+    from tkinter import filedialog
+    import soi_pdf_parser as soi_parser
+    tk.Tk().withdraw()
+    folder = filedialog.askdirectory(title="Folder with Alteryx files")
+    if not folder:
+        return
+    cy = filedialog.askopenfilename(title="SOI CY (current year financial statements PDF)", filetypes=[("PDF", "*.pdf")])
+    py = filedialog.askopenfilename(title="SOI PY (prior year financial statements PDF) - Cancel if none",
+                                    filetypes=[("PDF", "*.pdf")])
+    cy_df = soi_parser.parse_path(cy)[0] if cy else None
+    py_df = soi_parser.parse_path(py)[0] if py else None
+    out = Path(folder) / f"Review_{datetime.now():%Y%m%d_%H%M}.xlsx"
+    run_matching(folder, cy_df, py_df, {}, out, mappings_path=Path(folder) / "mappings.xlsx")
+
+
+if __name__ == "__main__":
+    main()

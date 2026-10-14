@@ -1,0 +1,562 @@
+"""
+Step 3: reviewed Review file -> Statement of Changes in the Portfolio (Major Purchases / Major Sales)
+as ONE Word document (each fund starts on a new page) + PDF.
+
+Layout rules (Nomura, as in the published Interim/Annual Report):
+  - page header on EVERY page (Word header, per fund section): umbrella / fund name (as in SOI) /
+    "STATEMENT OF CHANGES IN THE PORTFOLIO" (+ " (CONTINUED)" on every page except the very first) /
+    "For the half year ended 30th June, 2026" or "For the year ended 31st December, 2025"
+  - page number in the footer (optional starting number, e.g. 482, to match the report)
+  - the UCITS intro paragraph only once, on the first page
+  - table header row holds the title: "Major Purchases | Nominal | Cost USD", "Major Sales | Nominal | Proceeds USD";
+    "Total Purchases"/"Total Sales" when the fund has fewer rows than total_label_below (all transactions shown)
+  - Major Sales stays on the same page when it fits under Major Purchases, otherwise it starts on the
+    next page (Word decides: all Sales rows are "keep with next"; a Sales table longer than a page
+    always starts on a new page)
+  - long tables continue on the next page with the column header repeated; rows never split
+  - order of rows = Alteryx order (column "No"); names = column "Final Name"
+
+Checks (written to Word_Check_<timestamp>.xlsx next to the document):
+  - every fund/side: number of rows and total amount, Review vs Word (difference = rounding only)
+  - blocking: empty Final Name, or a name still containing [COUPON?] / [DATE?]
+  - warning: RED rows whose Final Name was not changed by a person
+
+Standalone usage:  python word_builder.py Review_xxx.xlsx "31/12/2025"
+Requires: pip install python-docx pandas openpyxl ; PDF via Word (pywin32) or LibreOffice
+"""
+
+import math
+import re
+import shutil
+import subprocess
+from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
+
+import pandas as pd
+from docx import Document
+from docx.enum.section import WD_ORIENT, WD_SECTION
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Pt, Cm
+
+# Defaults - the client profile ("output" section) can override any of these keys.
+OUTPUT_DEFAULTS = {
+    "umbrella": "NOMURA FUNDS IRELAND PLC",
+    "statement_title": "STATEMENT OF CHANGES IN THE PORTFOLIO",
+    "continued_suffix": " (CONTINUED)",          # every page except the very first one
+    "header_lines": ["{umbrella}", "{fund_name}", "{statement_title}", "{period_line}"],
+    "report_type": "auto",                       # auto (30/06 -> interim, otherwise annual) / interim / annual
+    "period_line_interim": "For the half year ended {period_long}",
+    "period_line_annual": "For the year ended {period_long}",
+    "intro_text": ("In accordance with the UCITS Regulations, the annual report documents material changes that "
+                   "have occurred in the disposition of the assets of the Company during the financial period. "
+                   "A material change is defined as aggregate purchase of a security exceeding 1 percent of the "
+                   "total value of purchased for the financial period and/or aggregate disposals greater than "
+                   "1 percent of the total value of sales for the financial period. If there are fewer than 20 "
+                   "purchases/sales that meet the material change definition, the Company shall disclose those "
+                   "purchase/sales and such number of the next largest purchases/sales so at least 20 "
+                   "purchases/sales are disclosed."),
+    "purchases_title": "Major Purchases",
+    "sales_title": "Major Sales",
+    "purchases_title_all": "Total Purchases",    # used when the side has fewer rows than total_label_below
+    "sales_title_all": "Total Sales",
+    "total_label_below": 20,                     # 0 = always "Major ..."
+    "col_nominal": "Nominal",
+    "col_purchases_amount": "Cost {ccy}",
+    "col_sales_amount": "Proceeds {ccy}",
+    "header_rule": True,                        # thin line under the table header row
+    "font": "Times New Roman",
+    "font_size": 9,
+    "header_font_size": 10,
+    "page_numbers": True,
+    "first_page_number": None,                   # e.g. 482 -> numbering continues the report
+    "col_widths_cm": [11.0, 3.0, 3.0],     # name / nominal / amount (A4 portrait, 2 cm margins = 17 cm)
+    "margins_cm": [2.5, 2.0, 2.0, 2.0],     # top, bottom, left, right
+    "sales_new_page": "always",             # "always" = Sales starts on its own page (as in the real report); "fit" = after Purchases if it fits
+    "rows_per_page": 55,                     # estimate used only to decide "Sales on a new page"
+    "make_pdf": True,
+}
+
+BLOCKING_MARKERS = ["[COUPON?]", "[DATE?]"]
+_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
+           "October", "November", "December"]
+
+
+# ============================ helpers ============================
+def _isna(v):
+    try:
+        return v is None or bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _fid(v):
+    if _isna(v):
+        return ""
+    if isinstance(v, float) and v == int(v):
+        return str(int(v))
+    t = str(v).strip()
+    return t[:-2] if t.endswith(".0") else t
+
+
+def to_num(v):
+    if _isna(v):
+        return None
+    t = str(v).strip().replace(",", "").replace(" ", "")
+    neg = (t.startswith("(") and t.endswith(")")) or t.endswith("-")
+    t = t.strip("()").rstrip("-")
+    try:
+        f = float(t)
+    except ValueError:
+        return None
+    return -f if neg else f
+
+
+def round_half_up(v):
+    """Whole units, halves rounded UP like Excel ROUND (2.5 -> 3), not Python's half-to-even."""
+    return int(Decimal(str(v)).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
+def fmt_int(v):
+    if v is None:
+        return ""
+    n = round_half_up(v)
+    return f"({abs(n):,})" if n < 0 else f"{n:,}"
+
+
+def long_date(text):
+    """'31/12/2025' or '2025-12-31' -> '31st December, 2025'. Other text is returned unchanged."""
+    t = str(text or "").strip()
+    m = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})", t) or None
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+        if not m:
+            return t
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1 <= mo <= 12 and 1 <= d <= 31):
+        return t
+    sfx = "th" if 11 <= d <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
+    return f"{d}{sfx} {_MONTHS[mo - 1]}, {y}"
+
+
+def report_type(period, cfg):
+    """'interim' or 'annual'. auto: period ending 30/06 -> interim (Nomura year end = 31/12)."""
+    t = str(cfg.get("report_type") or "auto").lower()
+    if t in ("interim", "annual"):
+        return t
+    m = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})", str(period or "").strip())
+    if m:
+        return "interim" if (int(m.group(1)), int(m.group(2))) == (30, 6) else "annual"
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", str(period or "").strip())
+    if m:
+        return "interim" if (int(m.group(3)), int(m.group(2))) == (30, 6) else "annual"
+    return "annual"
+
+
+# values written into client JSONs by v0.3 (first Word version) - replaced by the new defaults
+_OLD_V03 = {
+    "header_lines": [["{umbrella}", "{fund_name}", "STATEMENT OF CHANGES IN THE PORTFOLIO",
+                      "For the year ended {period_long}"]],
+    "intro_text": [("The Central Bank UCITS Regulations require a statement of changes in the composition of the "
+                    "portfolio during the reporting period reflecting the aggregate purchases and sales of a security "
+                    "exceeding one per cent of the total value of purchases and sales for the period. At a minimum "
+                    "the largest 20 purchases and sales are required to be disclosed. If there are fewer than 20 "
+                    "purchases or sales that exceed 1 per cent, then all purchases or sales are disclosed.")],
+    "margins_cm": [[2.0, 2.0, 2.0, 2.0]],
+}
+
+
+def _cfg(profile):
+    out = dict(OUTPUT_DEFAULTS)
+    for k, v in ((profile or {}).get("output") or {}).items():
+        if v in _OLD_V03.get(k, []):
+            continue            # old default left in the client JSON -> use the current default
+        out[k] = v
+    return out
+
+
+# ============================ fund info (fund map) ============================
+def load_fund_info(path):
+    """data/funds_<client>.xlsx -> {fund_id: {"ccy": base currency or None, "order": number or None}}."""
+    p = Path(path) if path else None
+    if not p or not p.exists():
+        return {}
+    df = pd.read_excel(p, dtype=str)
+    info = {}
+    for _, r in df.iterrows():
+        fid = _fid(r.get("Fund Id"))
+        if not fid:
+            continue
+        ccy = r.get("Base Currency")
+        order = to_num(r.get("Report Order"))
+        info[fid] = {"ccy": None if _isna(ccy) or not str(ccy).strip() else str(ccy).strip().upper(),
+                     "order": order}
+    return info
+
+
+# ============================ docx formatting ============================
+def _set_cell_border(cell, **edges):
+    """_set_cell_border(cell, bottom=4) -> thin bottom rule (size in 1/8 pt)."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = tc_pr.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tc_pr.append(borders)
+    for edge, size in edges.items():
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), str(size))
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "000000")
+        borders.append(el)
+
+
+def _row_flags(row, header=False):
+    tr_pr = row._tr.get_or_add_trPr()
+    cant = OxmlElement("w:cantSplit")       # a row is never split across pages
+    tr_pr.append(cant)
+    if header:
+        th = OxmlElement("w:tblHeader")     # header row repeated on every page
+        tr_pr.append(th)
+
+
+def _para(container, text, cfg, bold=False, align=None, space_after=0, keep_next=False, page_break=False,
+          size=None):
+    p = container.add_paragraph()
+    pf = p.paragraph_format
+    pf.space_before = Pt(0)
+    pf.space_after = Pt(space_after)
+    pf.keep_with_next = keep_next
+    pf.page_break_before = page_break
+    if align:
+        p.alignment = align
+    r = p.add_run(text)
+    r.bold = bold
+    r.font.name = cfg["font"]
+    r.font.size = Pt(size or cfg["font_size"])
+    return p
+
+
+def _cell_text(cell, text, cfg, bold=False, align=None, keep_next=False):
+    p = cell.paragraphs[0]
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.keep_with_next = keep_next
+    if align:
+        p.alignment = align
+    r = p.add_run(text)
+    r.bold = bold
+    r.font.name = cfg["font"]
+    r.font.size = Pt(cfg["font_size"])
+
+
+def _lines_for(name, cfg):
+    """Rough number of printed lines for a name in the name column (for the page-fit estimate)."""
+    chars = max(20, int(cfg["col_widths_cm"][0] * 5.2 * 9 / cfg["font_size"]))
+    return max(1, math.ceil(len(str(name)) / chars))
+
+
+def _add_side(doc, rows, title, amount_header, cfg, keep_together=False, page_break=False):
+    """One table; the title sits in the first cell of the (repeated) header row, like in the Nomura report.
+    keep_together=True: every row keeps with the next one, so Word moves the whole table to the next page
+    when it does not fit under the previous one."""
+    if page_break:
+        _para(doc, "", cfg, page_break=True, keep_next=True)
+    t = doc.add_table(rows=1, cols=3)
+    t.alignment = WD_TABLE_ALIGNMENT.LEFT
+    t.autofit = False
+    hdr = t.rows[0]
+    _row_flags(hdr, header=True)
+    for i, (txt, al) in enumerate(((title, None), (cfg["col_nominal"], WD_ALIGN_PARAGRAPH.RIGHT),
+                                   (amount_header, WD_ALIGN_PARAGRAPH.RIGHT))):
+        _cell_text(hdr.cells[i], txt, cfg, bold=True, align=al, keep_next=True)
+        hdr.cells[i].paragraphs[0].paragraph_format.space_after = Pt(4)
+        if cfg.get("header_rule"):
+            _set_cell_border(hdr.cells[i], top=6, bottom=4)
+    for n, r in enumerate(rows):
+        last = n == len(rows) - 1
+        row = t.add_row()
+        _row_flags(row)
+        kn = keep_together and not last
+        _cell_text(row.cells[0], r["name"], cfg, keep_next=kn)
+        _cell_text(row.cells[1], fmt_int(r["nominal"]), cfg, align=WD_ALIGN_PARAGRAPH.RIGHT, keep_next=kn)
+        _cell_text(row.cells[2], fmt_int(r["amount"]), cfg, align=WD_ALIGN_PARAGRAPH.RIGHT, keep_next=kn)
+    # fixed layout + grid widths: Word AND LibreOffice then keep the column widths
+    tbl_pr = t._tbl.tblPr
+    layout = OxmlElement("w:tblLayout")
+    layout.set(qn("w:type"), "fixed")
+    tbl_pr.append(layout)
+    for i, w in enumerate(cfg["col_widths_cm"]):
+        t.columns[i].width = Cm(w)
+        for cell in t.columns[i].cells:
+            cell.width = Cm(w)
+    return t
+
+
+def _field(paragraph, instr, cfg):
+    """Inserts a Word field (e.g. PAGE) into a paragraph."""
+    run = paragraph.add_run()
+    run.font.name = cfg["font"]
+    run.font.size = Pt(cfg["font_size"])
+    for kind, text in (("begin", None), (None, instr), ("separate", None), (None, "1"), ("end", None)):
+        if kind:
+            el = OxmlElement("w:fldChar")
+            el.set(qn("w:fldCharType"), kind)
+        elif text == instr:
+            el = OxmlElement("w:instrText")
+            el.set(qn("xml:space"), "preserve")
+            el.text = f" {instr} "
+        else:
+            el = OxmlElement("w:t")
+            el.text = text
+        run._r.append(el)
+
+
+def _p_border(p, edge="bottom", sz=4, space=6):
+    p_pr = p._p.get_or_add_pPr()
+    b = OxmlElement("w:pBdr")
+    el = OxmlElement(f"w:{edge}")
+    el.set(qn("w:val"), "single"); el.set(qn("w:sz"), str(sz))
+    el.set(qn("w:space"), str(space)); el.set(qn("w:color"), "000000")
+    b.append(el)
+    p_pr.append(b)
+
+
+def _fill_header(hdr, lines, cfg):
+    """Left-aligned bold lines like the Nomura report: umbrella, rule, fund/title/period block, rule."""
+    hdr.is_linked_to_previous = False
+    for p in list(hdr.paragraphs):
+        p._p.getparent().remove(p._p)
+    for i, line in enumerate(lines):
+        last = i == len(lines) - 1
+        p = _para(hdr, line, cfg, bold=True, align=WD_ALIGN_PARAGRAPH.LEFT, size=cfg["header_font_size"],
+                  space_after=(14 if (i == 0 or last) else 0))
+        if cfg.get("header_lines_rule", True) and (i == 0 or last):
+            _p_border(p)
+
+
+def _fill_footer(ftr, cfg):
+    ftr.is_linked_to_previous = False
+    p = ftr.paragraphs[0] if ftr.paragraphs else ftr.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if cfg.get("page_numbers"):
+        _field(p, "PAGE", cfg)
+
+
+def _setup_section(sec, cfg, lines_first, lines_cont, is_first_fund):
+    """Page size/margins + header (fund lines) + footer (page number) for one fund section."""
+    sec.orientation = WD_ORIENT.PORTRAIT
+    sec.page_width, sec.page_height = Cm(21.0), Cm(29.7)
+    top, bottom, left, right = cfg["margins_cm"]
+    sec.top_margin, sec.bottom_margin, sec.left_margin, sec.right_margin = Cm(top), Cm(bottom), Cm(left), Cm(right)
+    sec.header_distance, sec.footer_distance = Cm(1.0), Cm(1.0)
+    _fill_header(sec.header, lines_cont, cfg)
+    _fill_footer(sec.footer, cfg)
+    if is_first_fund:
+        # very first page without "(CONTINUED)"; its next pages (long first fund) already "(CONTINUED)"
+        sec.different_first_page_header_footer = True
+        _fill_header(sec.first_page_header, lines_first, cfg)
+        _fill_footer(sec.first_page_footer, cfg)
+        if cfg.get("first_page_number"):
+            pg = OxmlElement("w:pgNumType")
+            pg.set(qn("w:start"), str(int(cfg["first_page_number"])))
+            # schema order matters for Word: pgNumType goes before cols/titlePg/docGrid
+            nxt = next((el for el in sec._sectPr if el.tag in {qn(f"w:{t}") for t in (
+                "cols", "formProt", "vAlign", "noEndnote", "titlePg", "textDirection", "bidi", "rtlGutter",
+                "docGrid")}), None)
+            if nxt is not None:
+                nxt.addprevious(pg)
+            else:
+                sec._sectPr.append(pg)
+    else:
+        sec.different_first_page_header_footer = False
+
+
+# ============================ main ============================
+def build_note(review_path, out_docx, profile=None, period="", fund_map_path=None, log=print, make_pdf=None):
+    """Returns (docx_path, pdf_path or None, check_path). Raises ValueError on blocking problems."""
+    cfg = _cfg(profile)
+    rv = pd.read_excel(review_path, sheet_name="Review", dtype={"Fund Id": str})
+    need = ["Fund Id", "SOI Fund", "Side", "No", "Final Name", "Nominal", "Amount", "Status", "Proposed Name"]
+    miss = [c for c in need if c not in rv.columns]
+    if miss:
+        raise ValueError(f"{Path(review_path).name}: not a Review file (missing columns {miss})")
+    rv["Fund Id"] = rv["Fund Id"].apply(_fid)
+    rv["Final Name"] = rv["Final Name"].apply(lambda v: "" if _isna(v) else str(v).strip())
+
+    # ---- blocking checks: nothing is generated when a name is missing or unfinished
+    bad = rv[(rv["Final Name"] == "") | rv["Final Name"].apply(lambda s: any(m in s for m in BLOCKING_MARKERS))]
+    if not bad.empty:
+        lines = [f"  fund {r['Fund Id']} {r['Side']} row {r['No']}: '{r['Final Name']}'" for _, r in bad.head(20).iterrows()]
+        raise ValueError("Final Name missing or unfinished ([COUPON?]/[DATE?]) in "
+                         f"{len(bad)} row(s) - fix them in the Review file first:\n" + "\n".join(lines))
+    prop = rv["Proposed Name"].apply(lambda v: "" if _isna(v) else str(v).strip())
+    red = rv[(rv["Status"] == "RED") & (rv["Final Name"] == prop)]
+    for _, r in red.iterrows():
+        log(f"  WARNING: fund {r['Fund Id']} {r['Side']} row {r['No']}: RED and Final Name not changed - "
+            f"'{r['Final Name']}'")
+
+    info = load_fund_info(fund_map_path)
+    period_long = long_date(period)
+    funds = list(dict.fromkeys(rv["Fund Id"]))
+    funds.sort(key=lambda f: (info.get(f, {}).get("order") is None, info.get(f, {}).get("order") or 0, f.zfill(12)))
+
+    rtype = report_type(period, cfg)
+    period_line = cfg["period_line_interim" if rtype == "interim" else "period_line_annual"].format(
+        period_long=period_long)
+    log(f"Report type: {rtype} -> '{period_line}'")
+
+    doc = Document()
+    st = doc.styles["Normal"]
+    st.font.name = cfg["font"]
+    st.font.size = Pt(cfg["font_size"])
+    st.element.rPr.rFonts.set(qn("w:eastAsia"), cfg["font"])
+    st.paragraph_format.space_after = Pt(0)
+    doc._body.clear_content()        # keeps the sectPr (first section)
+
+    limit = int(cfg.get("total_label_below") or 0)
+    checks = []
+    for k, fid in enumerate(funds):
+        g = rv[rv["Fund Id"] == fid]
+        fund_name = next((str(x).strip() for x in g["SOI Fund"] if not _isna(x) and str(x).strip()), None)
+        if not fund_name:
+            fund_name = f"[FUND NAME? Fund Id {fid}]"
+            log(f"  WARNING: fund {fid}: no SOI fund name in the Review file - placeholder printed")
+        ccy = info.get(fid, {}).get("ccy")
+        if not ccy:
+            ccy = "[CCY]"
+            log(f"  WARNING: fund {fid}: no Base Currency in the fund map - '[CCY]' printed in the column header")
+        repl = {"umbrella": cfg["umbrella"], "fund_name": fund_name, "period_long": period_long, "ccy": ccy,
+                "period_line": period_line, "statement_title": cfg["statement_title"]}
+        lines_first = [ln.format(**repl) for ln in cfg["header_lines"]]
+        repl_c = dict(repl, statement_title=cfg["statement_title"] + cfg["continued_suffix"])
+        lines_cont = [ln.format(**repl_c) for ln in cfg["header_lines"]]
+
+        # each fund = own section (new page, own header). The sectPr of section k sits in the last paragraph
+        # of section k, so: fund 0 uses the document's final section; later funds add a section break first.
+        if k > 0:
+            new = doc.add_section(WD_SECTION.NEW_PAGE)
+            # add_section copies the previous sectPr incl. header/footer references and page-number restart:
+            # drop them so this fund gets its OWN header parts and the numbering continues
+            for hf in (new.header, new.footer, new.first_page_header, new.first_page_footer):
+                hf.is_linked_to_previous = True
+            for el in new._sectPr.findall(qn("w:pgNumType")):
+                new._sectPr.remove(el)
+        _setup_section(doc.sections[-1], cfg, lines_first, lines_cont, is_first_fund=(k == 0))
+
+        if k == 0 and cfg.get("intro_text"):
+            _para(doc, cfg["intro_text"].format(**repl), cfg, align=WD_ALIGN_PARAGRAPH.JUSTIFY, space_after=12)
+        purchases_lines = 0
+        for side, title_key, col_key in (("Purchases", "purchases_title", "col_purchases_amount"),
+                                         ("Sales", "sales_title", "col_sales_amount")):
+            s = g[g["Side"] == side].copy()
+            s["_no"] = pd.to_numeric(s["No"], errors="coerce")
+            s = s.sort_values("_no")
+            rows = [{"name": r["Final Name"], "nominal": to_num(r["Nominal"]), "amount": to_num(r["Amount"])}
+                    for _, r in s.iterrows()]
+            if not rows:
+                continue
+            title = cfg[title_key + "_all"] if limit and len(rows) < limit else cfg[title_key]
+            lines = 2 + sum(_lines_for(r["name"], cfg) for r in rows)
+            if side == "Purchases":
+                purchases_lines = lines
+                _add_side(doc, rows, title, cfg[col_key].format(**repl), cfg)
+                _para(doc, "", cfg, space_after=12)
+            else:
+                # longer than a page -> always a new page; otherwise Word keeps it together and moves it
+                # to the next page only when it does not fit under Purchases
+                new_page = purchases_lines > 0 and (cfg.get("sales_new_page", "always") == "always"
+                                                    or lines > cfg["rows_per_page"] - 2)
+                _add_side(doc, rows, title, cfg[col_key].format(**repl), cfg,
+                          keep_together=not new_page, page_break=new_page)
+            rev_total = sum(r["amount"] or 0 for r in rows)
+            word_total = sum(round_half_up(r["amount"]) for r in rows if r["amount"] is not None)
+            diff = word_total - rev_total
+            checks.append({"Fund Id": fid, "Fund": fund_name, "Side": side, "Title": title, "Currency": ccy,
+                           "Review Rows": len(s), "Word Rows": len(rows),
+                           "Review Total": rev_total, "Word Total (rounded)": word_total,
+                           "Rounding Difference": round(diff, 2),
+                           "Status": "OK" if len(s) == len(rows) and abs(diff) <= 0.5 * len(rows) + 1e-6
+                           and all(r["amount"] is not None for r in rows) else "CHECK"})
+
+    out_docx = Path(out_docx)
+    out_docx.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(out_docx)
+    log(f"Word saved: {out_docx} ({len(funds)} fund(s))")
+
+    check_path = out_docx.with_name(f"Word_Check_{datetime.now():%Y%m%d_%H%M}.xlsx")
+    ck = pd.DataFrame(checks)
+    with pd.ExcelWriter(check_path, engine="openpyxl") as xw:
+        ck.to_excel(xw, sheet_name="Word Check", index=False)
+        ws = xw.book["Word Check"]
+        ws.freeze_panes = "A2"
+        for col in ws.columns:
+            width = max(len(str(c.value)) if c.value is not None else 0 for c in col)
+            ws.column_dimensions[col[0].column_letter].width = min(max(10, width + 2), 60)
+    n_bad = int((ck["Status"] != "OK").sum()) if not ck.empty else 0
+    log(f"Word check: {len(ck)} table(s), {n_bad} to check -> {check_path.name}")
+
+    pdf = None
+    if cfg["make_pdf"] if make_pdf is None else make_pdf:
+        pdf = to_pdf(out_docx, log)
+    return str(out_docx), pdf, str(check_path)
+
+
+# ============================ PDF ============================
+def to_pdf(docx_path, log=print):
+    """Word (own instance, never the user's open Word) -> PDF; LibreOffice as fallback. Returns path or None."""
+    docx_path = Path(docx_path).resolve()
+    pdf_path = docx_path.with_suffix(".pdf")
+    try:
+        import pythoncom
+        import win32com.client as win32
+        pythoncom.CoInitialize()
+        word = win32.DispatchEx("Word.Application")   # separate instance - user's documents are not touched
+        try:
+            word.Visible = False
+            word.DisplayAlerts = 0
+            d = word.Documents.Open(str(docx_path), ReadOnly=True, AddToRecentFiles=False)
+            try:
+                d.ExportAsFixedFormat(str(pdf_path), 17)  # 17 = wdExportFormatPDF
+            finally:
+                d.Close(False)
+        finally:
+            word.Quit()
+            pythoncom.CoUninitialize()
+        log(f"PDF saved (Word): {pdf_path}")
+        return str(pdf_path)
+    except ImportError:
+        pass
+    except Exception as e:  # noqa: BLE001 - try LibreOffice, then report
+        log(f"  WARNING: PDF via Word failed ({e}) - trying LibreOffice")
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if soffice:
+        try:
+            subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", str(pdf_path.parent),
+                            str(docx_path)], check=True, capture_output=True, timeout=180)
+            log(f"PDF saved (LibreOffice - page breaks may differ slightly from Word): {pdf_path}")
+            return str(pdf_path)
+        except Exception as e:  # noqa: BLE001
+            log(f"  WARNING: PDF via LibreOffice failed ({e})")
+    log("  WARNING: PDF not created (no Word/pywin32 and no LibreOffice) - export it from Word manually")
+    return None
+
+
+def main():
+    import sys
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return
+    review = Path(sys.argv[1])
+    period = sys.argv[2] if len(sys.argv) > 2 else ""
+    out = review.with_name(f"PS_Note_{datetime.now():%Y%m%d_%H%M}.docx")
+    build_note(review, out, {}, period)
+
+
+if __name__ == "__main__":
+    main()

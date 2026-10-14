@@ -1,0 +1,413 @@
+"""
+SOI PDF Parser v1.3 - extracts securities from the Statement of Investments (PDF) into Excel.
+
+Usage:
+    python soi_pdf_parser.py                 -> file dialog to pick the PDF
+    python soi_pdf_parser.py path.pdf        -> no dialog
+    python soi_pdf_parser.py path\to\folder  -> all PDFs in the folder (e.g. one SOI per fund)
+
+Output: <pdf_name>_SOI_parsed.xlsx next to the PDF, sheets:
+    SOI              - all extracted securities
+    To Review        - lines with a date or % that could not be parsed
+    Subtotal Check   - parsed fair value per sector vs sector subtotal in the PDF
+    Summary          - number of securities per fund
+
+Requires: pip install pdfplumber pandas openpyxl
+"""
+
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+import pdfplumber
+
+# ============================ CONFIG ============================
+# Defaults only - never modified at runtime. A client profile passes its own values into parse_pdf().
+# SOI page titles (case-insensitive). Pages without any of them are skipped, unless they are
+# continuation pages of an SOI (see parse_pdf).
+SOI_TITLES = ["STATEMENT OF INVESTMENTS", "SCHEDULE OF INVESTMENTS", "PORTFOLIO OF INVESTMENTS"]
+# Lines to ignore (table headers, footers)
+# Table header words: a line is a header only if it contains 2+ of them (or is exactly one of them),
+# so names like "Alibaba Group Holding Ltd" are NOT dropped.
+HEADER_WORDS = ["Security Description", "Fair Value", "Holding", "% of Sub-Fund", "% of Net Assets", "Nominal"]
+# Phrases that are never security names (totals/footers) - substring match.
+IGNORE_CONTAINS = ["Net Current Assets", "Financial Assets at", "Financial Liabilities at", "Cash at Bank",
+                   "Other Net Assets", "Net Assets attributable"]
+# Headings that mean a page belongs to another statement (used for continuation pages without a title)
+# (no bare "REPORT": running headers such as "Annual Report 2025" are on every page)
+OTHER_HEADINGS = ["STATEMENT OF", "NOTES TO", "SCHEDULE OF", "PORTFOLIO OF", "REPORT OF", "AUDITOR", "BALANCE SHEET"]
+# The SOI title must be in the first lines of a page (a notes page may mention "Schedule of Investments" in prose)
+TITLE_TOP_LINES = 8
+# Maximum number of lines a wrapped security name can span
+MAX_WRAP_LINES = 3
+# ================================================================
+
+# Debt security: "Meituan, 5.125%, 05/11/35 ..." or "United States Treasury Bill ZCP, 29/04/25 ..."
+# Coupon: 5.125% / 5.1% / 5% / ZCP. Date: dd/mm/yy, d/m/yy, dd/mm/yyyy or "Perpetual".
+# A 4-digit year only when no digit/comma follows: long names can glue the date to the holding
+# ("15/05/30500,000" = 15/05/30 + 500,000).
+SEC_RE = re.compile(
+    r"^(?P<name>.+?),?\s+(?P<cpn>\d{1,2}(?:\.\d{1,4})?%|ZCP),\s*"
+    r"(?P<date>\d{1,2}/\d{1,2}/(?:\d{4}(?![\d,])|\d{2})|Perpetual\b)(?P<rest>.*)$", re.I
+)
+# Country/sector header: "Financial - 3.74% (31st December, 2024: 7.22%)"
+HEADER_RE = re.compile(r"^(?P<label>.+?)\s+-\s+[\d.,–-]*%?\s*\(\d{1,2}(st|nd|rd|th)\s", re.I)
+DATE_ANYWHERE_RE = re.compile(r"\d{1,2}/\d{1,2}/\d{2,4}")
+NUM_RE = re.compile(r"^\(?-?[\d,]+(\.\d+)?\)?%?$")
+# Equity: "State Bank of India 4,053,980 38,337,394 3.52%" (name + holding + fair value + %)
+EQ_RE = re.compile(
+    r"^(?P<name>.*[A-Za-z].*?)\s+(?P<hold>\(?[\d,]+(?:\.\d+)?\)?)\s+(?P<fv>\(?[\d,]+(?:\.\d+)?\)?)\s+(?P<pct>\(?-?[\d.]+%\)?)\s*$"
+)
+# Footnote markers at the end of an equity name: (1), (a), (ii). NOT share-class tags like (Pref), (ADR), (DVR).
+TRAIL_FOOTNOTE_RE = re.compile(r"\s*\(\s*(?:\d{1,2}|[a-z]|[ivx]{1,4})\s*\)\s*$")
+# Sector subtotal: "115,997,163 8.87%"
+SUBTOTAL_RE = re.compile(r"^\(?[\d,]+\)?\s+\(?-?[\d.]+%\)?$")
+# FX forwards: "JPY 1,243,864,282 USD (8,197,669) ..." - not part of P&S
+FORWARD_RE = re.compile(r"^[A-Z]{3}\s+\(?[\d,]+\)?\s+[A-Z]{3}\s+\(?[\d,]+\)?")
+FOOTNOTE_RE = re.compile(r"^\s*(\(\s*[\w]{1,4}\s*\)|\d(?=\s|$))")
+
+
+def to_number(tok):
+    tok = tok.replace(",", "").replace("%", "")
+    neg = tok.startswith("(") and tok.endswith(")")
+    tok = tok.strip("()")
+    try:
+        v = float(tok)
+    except ValueError:
+        return None
+    return -v if neg else v
+
+
+def parse_date(text):
+    """'05/11/35' -> 2035-11-05 (2-digit year always 20xx: perpetuals 73/74 -> 2073/2074);
+    '05/11/2035' -> 2035-11-05; 'Perpetual' -> None."""
+    if "/" not in text:
+        return None
+    d, m, y = (int(x) for x in text.split("/"))
+    try:
+        return date(y if y >= 100 else 2000 + y, m, d)
+    except ValueError:
+        return None
+
+
+def is_noise(line, ignore=IGNORE_CONTAINS, header_words=HEADER_WORDS):
+    s = line.strip()
+    if not s:
+        return True
+    low = s.lower()
+    hw = [w for w in header_words if w.lower() in low]
+    if len(hw) >= 2 or low in {w.lower() for w in header_words}:
+        return True
+    if any(k.lower() in low for k in ignore):
+        return True
+    # "Total Investments 1,234 98.5%" is noise; "TotalEnergies SE" / "Total Access Communication 1,000 2,000 0.5%"
+    # (name + holding + value + %) is a security
+    if re.match(r"TOTAL\b", s.upper()) and not EQ_RE.match(s):
+        return True
+    if FORWARD_RE.match(s):
+        return True
+    if all(NUM_RE.match(t) for t in s.split()):  # numbers only (subtotals)
+        return True
+    # NOTE: ALL CAPS lines are NOT treated as noise any more - some clients print security names in
+    # capitals. Page headers/countries are harmless: the buffer is reset by the table header line.
+    return False
+
+
+TRAILING_DESIG_RE = re.compile(r"^\s*(144A)(?=[\W\d]|$)", re.I)
+
+
+def split_rest(rest):
+    """Separates designations kept in the name ('144A' after the date) and footnotes (FRN)/(1)
+    from the numbers: holding, fair value, %."""
+    footnotes, desig = [], []
+    r = rest
+    while True:
+        d = TRAILING_DESIG_RE.match(r)
+        if d:
+            desig.append(d.group(1).upper())
+            r = r[d.end():]
+            continue
+        m = FOOTNOTE_RE.match(r)
+        if not m:
+            break
+        footnotes.append(m.group(1).strip())
+        r = r[m.end():]
+    nums = [t for t in r.split() if NUM_RE.match(t)]
+    pct = next((to_number(t) for t in nums if t.endswith("%")), None)
+    plain = [to_number(t) for t in nums if not t.endswith("%")]
+    holding = plain[0] if len(plain) > 0 else None
+    fair_value = plain[1] if len(plain) > 1 else None
+    return footnotes, holding, fair_value, pct, desig
+
+
+def has_title(lines, titles):
+    """SOI title within the first TITLE_TOP_LINES non-empty lines of the page."""
+    top = [x for x in lines if x.strip()][:TITLE_TOP_LINES]
+    return any(t in x.upper() for x in top for t in titles)
+
+
+def looks_like_name_part(text):
+    """First line of a security name wrapped over two lines: words, no numbers or %, not an ALL-CAPS label."""
+    t = text.strip()
+    return bool(t) and not re.search(r"[\d%]", t) and not t.isupper() and not t.endswith(":")
+
+
+def find_fund(lines, titles):
+    for i, ln in enumerate(lines):
+        if any(t in ln.upper() for t in titles):
+            for j in range(i - 1, -1, -1):
+                if lines[j].strip():
+                    return lines[j].strip()
+            return None
+    return None
+
+
+def parse_pdf(pdf_path, soi_titles=None, ignore_contains=None):
+    """soi_titles / ignore_contains - optional, from the client profile (clients/*.json).
+    Settings are local to this call (no global state)."""
+    titles = [t.upper() for t in (soi_titles or SOI_TITLES)]
+    # profile list may still contain header words (old template) - those use the 2+ header rule
+    hw_low = {w.lower() for w in HEADER_WORDS}
+    given = list(ignore_contains or IGNORE_CONTAINS)
+    header_words = HEADER_WORDS + [x for x in given if x.lower() in hw_low and x not in HEADER_WORDS]
+    ignore = [x for x in given if x.lower() not in hw_low]
+    rows, suspicious, checks = [], [], []
+    acc = {"sum": 0.0, "n": 0, "missing": 0}
+
+    def reset_acc():
+        acc.update(sum=0.0, n=0, missing=0)
+
+    def add_acc(fv):
+        acc["n"] += 1
+        if fv is None:
+            acc["missing"] += 1
+        else:
+            acc["sum"] += fv
+
+    with pdfplumber.open(pdf_path) as pdf:
+        fund = section = sector = None
+        in_soi = False
+        for pno, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            lines = [ln.strip() for ln in text.splitlines()]
+            if has_title(lines, titles):
+                in_soi, cont = True, False
+                new_fund = find_fund(lines, titles) or fund
+                if new_fund != fund:  # new fund - sector does not carry over from the previous one
+                    fund, section, sector = new_fund, None, None
+                    reset_acc()
+            else:
+                # Continuation page without the SOI title: accept it only if the previous page was an SOI,
+                # the page does not start another statement and it contains security lines.
+                head = " ".join(lines[:8]).upper()
+                has_secs = any(SEC_RE.match(x) or EQ_RE.match(x) for x in lines)
+                if in_soi and has_secs and not any(k in head for k in OTHER_HEADINGS):
+                    cont = True
+                else:
+                    if in_soi and has_secs:  # securities on a page right after the SOI, but skipped - say so
+                        suspicious.append({"Fund": fund, "Page": pno,
+                                           "Line": "PAGE SKIPPED: looks like another statement - check it is not an SOI page",
+                                           "Buffer": " | ".join(lines[:3])})
+                    in_soi = False
+                    continue
+            buffer = []
+
+            for ln in lines:
+                if not ln:
+                    continue
+                h = HEADER_RE.match(ln)
+                if h:
+                    label = h.group("label").strip()
+                    if label.isupper():
+                        section, sector = label, None
+                    else:
+                        sector = label
+                    buffer = []
+                    reset_acc()
+                    continue
+
+                sub = SUBTOTAL_RE.match(ln)
+                if sub and (acc["n"] > 0 or sector or section):
+                    pdf_total = to_number(ln.split()[0])
+                    diff = round(pdf_total - acc["sum"], 2)
+                    checks.append({
+                        "Fund": fund, "Page": pno, "Section": section, "Sector": sector,
+                        "PDF_Subtotal": pdf_total, "Parsed_Total": acc["sum"], "Difference": diff,
+                        "Securities": acc["n"], "Missing_Fair_Value": acc["missing"],
+                        "Status": "OK" if abs(diff) < 1 and acc["missing"] == 0 else "DIFFERENCE",
+                    })
+                    reset_acc()
+                    buffer = []
+                    continue
+
+                m = SEC_RE.match(ln)
+                used = ln
+                possible_wrap = ""
+                if buffer:
+                    if m:
+                        # The last line of a wrapped name carries coupon + date, so it matches on its own.
+                        # Join the previous line when it looks like the start of a name; otherwise flag it.
+                        prev = buffer[-1]
+                        mj = SEC_RE.match(prev + " " + ln) if looks_like_name_part(prev) else None
+                        if mj:
+                            m, used = mj, prev + " " + ln
+                        else:
+                            possible_wrap = " ".join(buffer)
+                    else:
+                        joined = " ".join(buffer + [ln])
+                        mj = SEC_RE.match(joined)
+                        if mj:
+                            m, used = mj, joined
+                if m:
+                    footnotes, holding, fv, pct, desig = split_rest(m.group("rest"))
+                    cpn_txt = m.group("cpn")
+                    rows.append({
+                        "Fund": fund,
+                        "Page": pno,
+                        "Type": "Debt",
+                        "Section": section,
+                        "Sector": sector,
+                        "Issuer": m.group("name").strip().rstrip(","),
+                        "Coupon": None if cpn_txt.upper() == "ZCP" else float(cpn_txt.rstrip("%")),
+                        "ZCP": cpn_txt.upper() == "ZCP",
+                        "Maturity": parse_date(m.group("date")),
+                        # '..., 08/01/29 144A' - 144A after the date is part of the published name
+                        "Name_publication": " ".join([used[: m.end("date")].strip()] + desig),
+                        "Footnotes": " ".join(footnotes),
+                        "Holding": holding,
+                        "Fair_Value": fv,
+                        "Pct": pct,
+                        "Wrapped": used != ln,
+                        "Continuation_Page": cont,
+                        "Check_prev_line": possible_wrap,
+                        "Raw_line": used,
+                    })
+                    add_acc(fv)
+                    buffer = []
+                    continue
+
+                numeric_only = all(NUM_RE.match(t) for t in ln.split())
+
+                # numbers on a separate line below a debt row without numbers -> attach them to it
+                if numeric_only and not buffer and rows and rows[-1]["Page"] == pno \
+                        and rows[-1]["Type"] == "Debt" and rows[-1]["Fair_Value"] is None:
+                    _, h_, fv_, pct_, _ = split_rest(" " + ln)
+                    if fv_ is not None:
+                        rows[-1].update(Holding=h_, Fair_Value=fv_, Pct=pct_)
+                        acc["missing"] -= 1
+                        acc["sum"] += fv_
+                        continue
+
+                # --- equities (no coupon or maturity) ---
+                if not is_noise(ln, ignore, header_words) or (buffer and numeric_only):
+                    e, used_e = EQ_RE.match(ln), ln
+                    if not e and buffer:
+                        ej = EQ_RE.match(" ".join(buffer + [ln]))
+                        if ej:
+                            e, used_e = ej, " ".join(buffer + [ln])
+                    if e and (DATE_ANYWHERE_RE.search(e.group("name")) or "%" in e.group("name")):
+                        e = None  # a coupon or date in the "name" = a debt line SEC_RE could not read -> To Review
+                    if e:
+                        name = e.group("name").strip()
+                        footnotes = []
+                        while TRAIL_FOOTNOTE_RE.search(name):
+                            fn = TRAIL_FOOTNOTE_RE.search(name)
+                            footnotes.insert(0, fn.group(0).strip())
+                            name = name[:fn.start()].strip()
+                        rows.append({
+                            "Fund": fund, "Page": pno, "Type": "Equity",
+                            "Section": section, "Sector": sector,
+                            "Issuer": name, "Coupon": None, "ZCP": False, "Maturity": None,
+                            "Name_publication": name,
+                            "Footnotes": " ".join(footnotes),
+                            "Holding": to_number(e.group("hold")),
+                            "Fair_Value": to_number(e.group("fv")),
+                            "Pct": to_number(e.group("pct")),
+                            "Wrapped": used_e != ln,
+                            "Continuation_Page": cont,
+                            "Check_prev_line": " ".join(buffer) if (buffer and used_e == ln) else "",
+                            "Raw_line": used_e,
+                        })
+                        add_acc(to_number(e.group("fv")))
+                        buffer = []
+                        continue
+
+                if (DATE_ANYWHERE_RE.search(ln) or ln.rstrip(")").endswith("%")) and not is_noise(ln, ignore, header_words):
+                    suspicious.append({"Fund": fund, "Page": pno, "Line": ln, "Buffer": " | ".join(buffer)})
+                if is_noise(ln, ignore, header_words):
+                    buffer = []
+                else:
+                    buffer = (buffer + [ln])[-(MAX_WRAP_LINES - 1):]
+    sus_cols = ["Fund", "Page", "Line", "Buffer"]
+    chk_cols = ["Fund", "Page", "Section", "Sector", "PDF_Subtotal", "Parsed_Total", "Difference",
+                "Securities", "Missing_Fair_Value", "Status"]
+    return pd.DataFrame(rows), pd.DataFrame(suspicious, columns=sus_cols), pd.DataFrame(checks, columns=chk_cols)
+
+
+def parse_path(path, soi_titles=None, ignore_contains=None, log=print):
+    """Accepts a single PDF or a folder of PDFs (e.g. one SOI per fund). Results are combined."""
+    p = Path(path)
+    files = sorted(f for f in p.glob("*.pdf") if not f.name.startswith("~$")) if p.is_dir() else [p]
+    if not files:
+        raise ValueError(f"No PDF files found in: {p}")
+    parts = []
+    for f in files:
+        df, sus, chk = parse_pdf(f, soi_titles, ignore_contains)
+        for d in (df, sus, chk):
+            d.insert(0, "Source_File", f.name)
+        if len(files) > 1:
+            log(f"  {f.name}: {len(df)} securities, {df['Fund'].nunique() if not df.empty else 0} fund(s)")
+        parts.append((df, sus, chk))
+    return tuple(pd.concat([pt[i] for pt in parts], ignore_index=True) for i in range(3))
+
+
+def main():
+    if len(sys.argv) > 1:
+        pdf_path = Path(sys.argv[1])   # a PDF file or a folder with PDFs
+    else:
+        import tkinter as tk
+        from tkinter import filedialog
+        tk.Tk().withdraw()
+        p = filedialog.askopenfilename(title="Select the financial statements PDF", filetypes=[("PDF", "*.pdf")])
+        if not p:
+            return
+        pdf_path = Path(p)
+
+    df, sus, chk = parse_path(pdf_path)
+    out = (pdf_path / "SOI_parsed.xlsx") if pdf_path.is_dir() else pdf_path.with_name(pdf_path.stem + "_SOI_parsed.xlsx")
+    save_excel(df, sus, out, chk)
+    bad = int((chk["Status"] != "OK").sum()) if not chk.empty else 0
+    print(f"Securities: {len(df)} | To review: {len(sus)} | Funds: {df['Fund'].nunique() if not df.empty else 0}")
+    print(f"Sector subtotal check: {len(chk)} checked, {bad} with difference")
+    print(f"Saved: {out}")
+
+
+def save_excel(df, sus, out, chk=None):
+    summary = (df.groupby("Fund", dropna=False).size().reset_index(name="Securities")
+               if not df.empty else pd.DataFrame(columns=["Fund", "Securities"]))
+    with pd.ExcelWriter(out, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name="SOI", index=False)
+        sus.to_excel(xw, sheet_name="To Review", index=False)
+        if chk is not None:
+            chk.to_excel(xw, sheet_name="Subtotal Check", index=False)
+        summary.to_excel(xw, sheet_name="Summary", index=False)
+        for ws in xw.book.worksheets:
+            for row in ws.iter_rows():  # PDF text starting with '=' must stay text, never a formula
+                for c in row:
+                    if c.data_type == "f":
+                        c.data_type = "s"
+            ws.freeze_panes = "A2"
+            for col in ws.columns:
+                width = max(len(str(c.value)) if c.value is not None else 0 for c in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max(10, width + 2), 80)
+        ws = xw.book["SOI"]
+        for c in ws[1]:  # format the Maturity column by its header, not by a fixed letter
+            if c.value == "Maturity":
+                for cell in ws[c.column_letter][1:]:
+                    cell.number_format = "DD/MM/YYYY"
+
+
+if __name__ == "__main__":
+    main()
