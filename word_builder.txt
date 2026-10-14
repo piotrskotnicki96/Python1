@@ -10,9 +10,9 @@ Layout rules (Nomura, as in the published Interim/Annual Report):
   - the UCITS intro paragraph only once, on the first page
   - table header row holds the title: "Major Purchases | Nominal | Cost USD", "Major Sales | Nominal | Proceeds USD";
     "Total Purchases"/"Total Sales" when the fund has fewer rows than total_label_below (all transactions shown)
-  - Major Sales stays on the same page when it fits under Major Purchases, otherwise it starts on the
-    next page (Word decides: all Sales rows are "keep with next"; a Sales table longer than a page
-    always starts on a new page)
+  - each side (Purchases, Sales) starts on its own page, as in the real report (sales_new_page = "always");
+    "fit" = Sales follows Purchases when it fits (Word decides)
+  - intro text: intro_text_annual / intro_text_interim (chosen by report type); "intro_text" overrides both
   - long tables continue on the next page with the column header repeated; rows never split
   - order of rows = Alteryx order (column "No"); names = column "Final Name"
 
@@ -36,13 +36,27 @@ from pathlib import Path
 import pandas as pd
 from docx import Document
 from docx.enum.section import WD_ORIENT, WD_SECTION
-from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, Cm
 
 # Defaults - the client profile ("output" section) can override any of these keys.
+INTRO_ANNUAL = ("In accordance with the UCITS Regulations, the annual report documents material changes that "
+                "have occurred in the disposition of the assets of the Company during the financial period. "
+                "A material change is defined as aggregate purchase of a security exceeding 1 percent of the "
+                "total value of purchased for the financial period and/or aggregate disposals greater than "
+                "1 percent of the total value of sales for the financial period. If there are fewer than 20 "
+                "purchases/sales that meet the material change definition, the Company shall disclose those "
+                "purchase/sales and such number of the next largest purchases/sales so at least 20 "
+                "purchases/sales are disclosed.")
+# the real Nomura interim report (30 June 2026) uses exactly the same wording as the annual one
+INTRO_INTERIM = INTRO_ANNUAL
+# texts that were defaults in earlier versions of this file (ignored if still sitting in a client JSON)
+_OLD_INTRO = INTRO_ANNUAL.replace("financial period", "financial year")
+_OLD_INTRO_INTERIM = INTRO_ANNUAL.replace("annual report", "interim report")
+
 OUTPUT_DEFAULTS = {
     "umbrella": "NOMURA FUNDS IRELAND PLC",
     "statement_title": "STATEMENT OF CHANGES IN THE PORTFOLIO",
@@ -51,14 +65,10 @@ OUTPUT_DEFAULTS = {
     "report_type": "auto",                       # auto (30/06 -> interim, otherwise annual) / interim / annual
     "period_line_interim": "For the half year ended {period_long}",
     "period_line_annual": "For the year ended {period_long}",
-    "intro_text": ("In accordance with the UCITS Regulations, the annual report documents material changes that "
-                   "have occurred in the disposition of the assets of the Company during the financial period. "
-                   "A material change is defined as aggregate purchase of a security exceeding 1 percent of the "
-                   "total value of purchased for the financial period and/or aggregate disposals greater than "
-                   "1 percent of the total value of sales for the financial period. If there are fewer than 20 "
-                   "purchases/sales that meet the material change definition, the Company shall disclose those "
-                   "purchase/sales and such number of the next largest purchases/sales so at least 20 "
-                   "purchases/sales are disclosed."),
+    # Text above the first table. Two versions, picked by report_type (annual / interim).
+    # "intro_text" (if you set it in the client JSON) overrides both.
+    "intro_text_annual": INTRO_ANNUAL,
+    "intro_text_interim": INTRO_INTERIM,
     "purchases_title": "Major Purchases",
     "sales_title": "Major Sales",
     "purchases_title_all": "Total Purchases",    # used when the side has fewer rows than total_label_below
@@ -70,11 +80,17 @@ OUTPUT_DEFAULTS = {
     "header_rule": True,                        # thin line under the table header row
     "font": "Times New Roman",
     "font_size": 9,
-    "header_font_size": 10,
+    "header_font_size": 9,
+    "char_scale": 102,                         # % horizontal text scale: 9 pt at 102 % = the 9.17 pt width of the real report
+    "line_pt": 12.1,                           # exact line height of body text / table rows (measured on the real report)
+    "header_line_pt": 10.5,                    # exact line height of the page header lines
+    "page_number_size": 9.5,
     "page_numbers": True,
     "first_page_number": None,                   # e.g. 482 -> numbering continues the report
-    "col_widths_cm": [11.0, 3.0, 3.0],     # name / nominal / amount (A4 portrait, 2 cm margins = 17 cm)
-    "margins_cm": [2.5, 2.0, 2.0, 2.0],     # top, bottom, left, right
+    "col_widths_cm": [11.15, 2.48, 3.21],   # name / nominal / amount = 16.84 cm (measured on the real report, A4)
+    "margins_cm": [4.46, 3.4, 2.07, 2.07],   # top, bottom, left, right (top leaves room for the page header)
+    "header_distance_cm": 0.814,
+    "footer_distance_cm": 2.85,
     "sales_new_page": "always",             # "always" = Sales starts on its own page (as in the real report); "fit" = after Purchases if it fits
     "rows_per_page": 55,                     # estimate used only to decide "Sales on a new page"
     "make_pdf": True,
@@ -155,7 +171,8 @@ def report_type(period, cfg):
     m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", str(period or "").strip())
     if m:
         return "interim" if (int(m.group(3)), int(m.group(2))) == (30, 6) else "annual"
-    return "annual"
+    raise ValueError(f"Period '{period}' is not a date (use dd/mm/yyyy, e.g. 30/06/2026). "
+                     "Fix the Period field, or set report_type to 'annual' / 'interim' in the client profile.")
 
 
 # values written into client JSONs by v0.3 (first Word version) - replaced by the new defaults
@@ -167,8 +184,12 @@ _OLD_V03 = {
                     "exceeding one per cent of the total value of purchases and sales for the period. At a minimum "
                     "the largest 20 purchases and sales are required to be disclosed. If there are fewer than 20 "
                     "purchases or sales that exceed 1 per cent, then all purchases or sales are disclosed.")],
-    "margins_cm": [[2.0, 2.0, 2.0, 2.0]],
+    "margins_cm": [[2.0, 2.0, 2.0, 2.0], [2.5, 2.0, 2.0, 2.0]],
+    "header_font_size": [10],
+    "col_widths_cm": [[11.0, 3.0, 3.0]],
+    "header_rule": [False],
 }
+_OLD_V03["intro_text"] += [_OLD_INTRO, _OLD_INTRO_INTERIM]
 
 
 def _cfg(profile):
@@ -225,11 +246,22 @@ def _row_flags(row, header=False):
         tr_pr.append(th)
 
 
+def _scale(run, cfg):
+    pct = int(cfg.get("char_scale") or 100)
+    if pct != 100:
+        r_pr = run._r.get_or_add_rPr()
+        w = OxmlElement("w:w")
+        w.set(qn("w:val"), str(pct))
+        r_pr.insert_element_before(w, "w:kern", "w:position", "w:sz", "w:szCs", "w:highlight", "w:u", "w:effect",
+                                   "w:bdr", "w:shd", "w:fitText", "w:vertAlign", "w:rtl", "w:cs", "w:em", "w:lang")
+
+
 def _para(container, text, cfg, bold=False, align=None, space_after=0, keep_next=False, page_break=False,
-          size=None):
+          size=None, line=None, space_before=0):
     p = container.add_paragraph()
     pf = p.paragraph_format
-    pf.space_before = Pt(0)
+    pf.space_before = Pt(space_before)
+    pf.line_spacing = Pt(line or cfg["line_pt"])        # exact line height
     pf.space_after = Pt(space_after)
     pf.keep_with_next = keep_next
     pf.page_break_before = page_break
@@ -239,6 +271,7 @@ def _para(container, text, cfg, bold=False, align=None, space_after=0, keep_next
     r.bold = bold
     r.font.name = cfg["font"]
     r.font.size = Pt(size or cfg["font_size"])
+    _scale(r, cfg)
     return p
 
 
@@ -246,6 +279,7 @@ def _cell_text(cell, text, cfg, bold=False, align=None, keep_next=False):
     p = cell.paragraphs[0]
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.line_spacing = Pt(cfg["line_pt"])
     p.paragraph_format.keep_with_next = keep_next
     if align:
         p.alignment = align
@@ -253,6 +287,7 @@ def _cell_text(cell, text, cfg, bold=False, align=None, keep_next=False):
     r.bold = bold
     r.font.name = cfg["font"]
     r.font.size = Pt(cfg["font_size"])
+    _scale(r, cfg)
 
 
 def _lines_for(name, cfg):
@@ -265,8 +300,6 @@ def _add_side(doc, rows, title, amount_header, cfg, keep_together=False, page_br
     """One table; the title sits in the first cell of the (repeated) header row, like in the Nomura report.
     keep_together=True: every row keeps with the next one, so Word moves the whole table to the next page
     when it does not fit under the previous one."""
-    if page_break:
-        _para(doc, "", cfg, page_break=True, keep_next=True)
     t = doc.add_table(rows=1, cols=3)
     t.alignment = WD_TABLE_ALIGNMENT.LEFT
     t.autofit = False
@@ -275,9 +308,10 @@ def _add_side(doc, rows, title, amount_header, cfg, keep_together=False, page_br
     for i, (txt, al) in enumerate(((title, None), (cfg["col_nominal"], WD_ALIGN_PARAGRAPH.RIGHT),
                                    (amount_header, WD_ALIGN_PARAGRAPH.RIGHT))):
         _cell_text(hdr.cells[i], txt, cfg, bold=True, align=al, keep_next=True)
-        hdr.cells[i].paragraphs[0].paragraph_format.space_after = Pt(4)
+        if page_break and i == 0:
+            hdr.cells[0].paragraphs[0].paragraph_format.page_break_before = True
         if cfg.get("header_rule"):
-            _set_cell_border(hdr.cells[i], top=6, bottom=4)
+            _set_cell_border(hdr.cells[i], top=7, bottom=4)     # 0.9 pt above, 0.5 pt below (as in the report)
     for n, r in enumerate(rows):
         last = n == len(rows) - 1
         row = t.add_row()
@@ -286,11 +320,24 @@ def _add_side(doc, rows, title, amount_header, cfg, keep_together=False, page_br
         _cell_text(row.cells[0], r["name"], cfg, keep_next=kn)
         _cell_text(row.cells[1], fmt_int(r["nominal"]), cfg, align=WD_ALIGN_PARAGRAPH.RIGHT, keep_next=kn)
         _cell_text(row.cells[2], fmt_int(r["amount"]), cfg, align=WD_ALIGN_PARAGRAPH.RIGHT, keep_next=kn)
+        # a name wrapped over 2 lines: the numbers sit on the LAST line (as in the real report)
+        row.cells[1].vertical_alignment = WD_ALIGN_VERTICAL.BOTTOM
+        row.cells[2].vertical_alignment = WD_ALIGN_VERTICAL.BOTTOM
     # fixed layout + grid widths: Word AND LibreOffice then keep the column widths
     tbl_pr = t._tbl.tblPr
     layout = OxmlElement("w:tblLayout")
     layout.set(qn("w:type"), "fixed")
-    tbl_pr.append(layout)
+    mar = OxmlElement("w:tblCellMar")        # no side padding: text starts exactly at the margin, numbers end at the edge
+    for edge in ("top", "left", "bottom", "right"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:w"), "0"); el.set(qn("w:type"), "dxa")
+        mar.append(el)
+    look = tbl_pr.find(qn("w:tblLook"))          # schema order: tblLayout, tblCellMar, then tblLook
+    for el in (layout, mar):
+        if look is not None:
+            look.addprevious(el)
+        else:
+            tbl_pr.append(el)
     for i, w in enumerate(cfg["col_widths_cm"]):
         t.columns[i].width = Cm(w)
         for cell in t.columns[i].cells:
@@ -298,11 +345,11 @@ def _add_side(doc, rows, title, amount_header, cfg, keep_together=False, page_br
     return t
 
 
-def _field(paragraph, instr, cfg):
+def _field(paragraph, instr, cfg, size=None):
     """Inserts a Word field (e.g. PAGE) into a paragraph."""
     run = paragraph.add_run()
     run.font.name = cfg["font"]
-    run.font.size = Pt(cfg["font_size"])
+    run.font.size = Pt(size or cfg["font_size"])
     for kind, text in (("begin", None), (None, instr), ("separate", None), (None, "1"), ("end", None)):
         if kind:
             el = OxmlElement("w:fldChar")
@@ -324,7 +371,12 @@ def _p_border(p, edge="bottom", sz=4, space=6):
     el.set(qn("w:val"), "single"); el.set(qn("w:sz"), str(sz))
     el.set(qn("w:space"), str(space)); el.set(qn("w:color"), "000000")
     b.append(el)
-    p_pr.append(b)
+    p_pr.insert_element_before(b, "w:shd", "w:tabs", "w:suppressAutoHyphens", "w:kinsoku", "w:wordWrap",
+                               "w:overflowPunct", "w:topLinePunct", "w:autoSpaceDE", "w:autoSpaceDN", "w:bidi",
+                               "w:adjustRightInd", "w:snapToGrid", "w:spacing", "w:ind", "w:contextualSpacing",
+                               "w:mirrorIndents", "w:suppressOverlap", "w:jc", "w:textDirection",
+                               "w:textAlignment", "w:textboxTightWrap", "w:outlineLvl", "w:divId", "w:cnfStyle",
+                               "w:rPr", "w:sectPr", "w:pPrChange")
 
 
 def _fill_header(hdr, lines, cfg):
@@ -332,12 +384,15 @@ def _fill_header(hdr, lines, cfg):
     hdr.is_linked_to_previous = False
     for p in list(hdr.paragraphs):
         p._p.getparent().remove(p._p)
+    use_rule = cfg.get("header_lines_rule", True)
     for i, line in enumerate(lines):
         last = i == len(lines) - 1
         p = _para(hdr, line, cfg, bold=True, align=WD_ALIGN_PARAGRAPH.LEFT, size=cfg["header_font_size"],
-                  space_after=(14 if (i == 0 or last) else 0))
-        if cfg.get("header_lines_rule", True) and (i == 0 or last):
-            _p_border(p)
+                  line=cfg["header_line_pt"], space_before=(11 if i == 1 else 0))
+        if use_rule and i == 0:
+            _p_border(p, sz=3, space=11)
+        if use_rule and last:
+            _p_border(p, sz=3, space=13)
 
 
 def _fill_footer(ftr, cfg):
@@ -345,7 +400,7 @@ def _fill_footer(ftr, cfg):
     p = ftr.paragraphs[0] if ftr.paragraphs else ftr.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     if cfg.get("page_numbers"):
-        _field(p, "PAGE", cfg)
+        _field(p, "PAGE", cfg, size=cfg["page_number_size"])
 
 
 def _setup_section(sec, cfg, lines_first, lines_cont, is_first_fund):
@@ -354,27 +409,24 @@ def _setup_section(sec, cfg, lines_first, lines_cont, is_first_fund):
     sec.page_width, sec.page_height = Cm(21.0), Cm(29.7)
     top, bottom, left, right = cfg["margins_cm"]
     sec.top_margin, sec.bottom_margin, sec.left_margin, sec.right_margin = Cm(top), Cm(bottom), Cm(left), Cm(right)
-    sec.header_distance, sec.footer_distance = Cm(1.0), Cm(1.0)
+    sec.header_distance, sec.footer_distance = Cm(cfg["header_distance_cm"]), Cm(cfg["footer_distance_cm"])
     _fill_header(sec.header, lines_cont, cfg)
     _fill_footer(sec.footer, cfg)
-    if is_first_fund:
-        # very first page without "(CONTINUED)"; its next pages (long first fund) already "(CONTINUED)"
-        sec.different_first_page_header_footer = True
-        _fill_header(sec.first_page_header, lines_first, cfg)
-        _fill_footer(sec.first_page_footer, cfg)
-        if cfg.get("first_page_number"):
-            pg = OxmlElement("w:pgNumType")
-            pg.set(qn("w:start"), str(int(cfg["first_page_number"])))
-            # schema order matters for Word: pgNumType goes before cols/titlePg/docGrid
-            nxt = next((el for el in sec._sectPr if el.tag in {qn(f"w:{t}") for t in (
-                "cols", "formProt", "vAlign", "noEndnote", "titlePg", "textDirection", "bidi", "rtlGutter",
-                "docGrid")}), None)
-            if nxt is not None:
-                nxt.addprevious(pg)
-            else:
-                sec._sectPr.append(pg)
-    else:
-        sec.different_first_page_header_footer = False
+    # every fund: its first page without "(CONTINUED)", the following pages with it
+    sec.different_first_page_header_footer = True
+    _fill_header(sec.first_page_header, lines_first, cfg)
+    _fill_footer(sec.first_page_footer, cfg)
+    if is_first_fund and cfg.get("first_page_number"):
+        pg = OxmlElement("w:pgNumType")
+        pg.set(qn("w:start"), str(int(cfg["first_page_number"])))
+        # schema order matters for Word: pgNumType goes before cols/titlePg/docGrid
+        nxt = next((el for el in sec._sectPr if el.tag in {qn(f"w:{t}") for t in (
+            "cols", "formProt", "vAlign", "noEndnote", "titlePg", "textDirection", "bidi", "rtlGutter",
+            "docGrid")}), None)
+        if nxt is not None:
+            nxt.addprevious(pg)
+        else:
+            sec._sectPr.append(pg)
 
 
 # ============================ main ============================
@@ -449,8 +501,9 @@ def build_note(review_path, out_docx, profile=None, period="", fund_map_path=Non
                 new._sectPr.remove(el)
         _setup_section(doc.sections[-1], cfg, lines_first, lines_cont, is_first_fund=(k == 0))
 
-        if k == 0 and cfg.get("intro_text"):
-            _para(doc, cfg["intro_text"].format(**repl), cfg, align=WD_ALIGN_PARAGRAPH.JUSTIFY, space_after=12)
+        intro = cfg.get("intro_text") or cfg["intro_text_" + ("interim" if rtype == "interim" else "annual")]
+        if k == 0 and intro:
+            _para(doc, intro.format(**repl), cfg, align=WD_ALIGN_PARAGRAPH.JUSTIFY, space_after=12)
         purchases_lines = 0
         for side, title_key, col_key in (("Purchases", "purchases_title", "col_purchases_amount"),
                                          ("Sales", "sales_title", "col_sales_amount")):
@@ -466,7 +519,7 @@ def build_note(review_path, out_docx, profile=None, period="", fund_map_path=Non
             if side == "Purchases":
                 purchases_lines = lines
                 _add_side(doc, rows, title, cfg[col_key].format(**repl), cfg)
-                _para(doc, "", cfg, space_after=12)
+                _para(doc, "", cfg, size=1, line=1)
             else:
                 # longer than a page -> always a new page; otherwise Word keeps it together and moves it
                 # to the next page only when it does not fit under Purchases
