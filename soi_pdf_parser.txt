@@ -220,12 +220,17 @@ def parse_pdf(pdf_path, soi_titles=None, ignore_contains=None):
                 h = HEADER_RE.match(ln)
                 if h:
                     label = h.group("label").strip()
+                    # The same sector/section header repeated at the top of the next page while the sector is
+                    # still open (no subtotal yet) = the sector CONTINUES: keep the running sum and count,
+                    # otherwise the subtotal check only sees the securities from the new page.
+                    cont_hdr = acc["n"] > 0 and label == (section if label.isupper() else sector)
                     if label.isupper():
                         section, sector = label, None
                     else:
                         sector = label
                     buffer = []
-                    reset_acc()
+                    if not cont_hdr:
+                        reset_acc()
                     continue
 
                 sub = SUBTOTAL_RE.match(ln)
