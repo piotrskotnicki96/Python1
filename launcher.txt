@@ -18,6 +18,7 @@ Run:  python launcher.py
 
 import copy
 import json
+import sys
 import threading
 import traceback
 from datetime import datetime
@@ -29,7 +30,9 @@ import soi_pdf_parser as soi
 import matcher
 import word_builder
 
-APP_DIR = Path(__file__).resolve().parent
+# Folder with clients/, data/, output/. Built as .exe (PyInstaller) __file__ points into the program's
+# internal/temp folder, so data would be lost or hidden there: use the folder of the .exe instead.
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CLIENTS_DIR = APP_DIR / "clients"
 OUTPUT_DIR = APP_DIR / "output"
 SETTINGS_FILE = APP_DIR / "launcher_settings.json"
@@ -298,7 +301,11 @@ class Launcher(tk.Tk):
         out = self._out_dir(snap)
         target = out / f"PS_Note_{datetime.now():%Y%m%d_%H%M}.docx"
         self._log(f"Building Word from {Path(review_path).name} ...")
-        word_builder.build_note(review_path, target, self._profile(snap), snap["period"],
+        prof = self._profile(snap)
+        src = self.clients.get(snap["client"])
+        self._log(f"Profile: {snap['client']} ({src.name if src else 'built-in settings, no JSON file'}) | "
+                  f"page_numbers={prof['output'].get('page_numbers')} | first_page_number={prof['output'].get('first_page_number')}")
+        word_builder.build_note(review_path, target, prof, snap["period"],
                                                    fund_map_path=self._fund_map_file(snap), log=self._log)
         self._log("Step 3 done. Check the Word_Check file and read the document before publishing.")
 
