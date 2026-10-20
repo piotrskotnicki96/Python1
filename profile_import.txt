@@ -1,0 +1,408 @@
+"""
+Reads the LAYOUT of an existing Word note (e.g. last year's Statement of Changes in the Portfolio) and turns it into
+the "output" section of a client profile (clients/<client>.json).
+
+What is read (all from the Word file itself):
+  page      margins, header/footer distance, page size (warning if not A4)
+  header    lines of the page header (first page + continuation page), title suffix "(CONTINUED)", period line,
+            bold/size/line height, rules under the lines
+  footer    page numbers on/off, size, starting page number
+  body      intro text, table titles, column headers, column widths, font, size, line height, character scale,
+            header-row borders, "Sales starts on a new page"
+
+Only values that DIFFER from word_builder.OUTPUT_DEFAULTS are written to the client JSON (the JSON holds only
+differences). Everything the file does not contain keeps the default and is listed as "not found" in the report.
+
+Usage:
+    python profile_import.py last_year_note.docx                 # report only
+    python profile_import.py last_year_note.docx nomura           # report + writes clients/nomura.json
+    python profile_import.py last_year_note.docx nomura --clients-dir "C:\\...\\clients"
+Requires: pip install python-docx
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+
+from docx import Document
+from docx.enum.text import WD_LINE_SPACING
+from docx.oxml.ns import qn
+
+import word_builder
+
+DEFAULTS = dict(word_builder.OUTPUT_DEFAULTS, header_lines_rule=True)   # header_lines_rule: supported key, default True
+A4_CM = (21.0, 29.7)
+DATE_RE = re.compile(r"\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+,?\s+\d{4}|\d{1,2}[/.-]\d{1,2}[/.-]\d{4}")
+PROGRAM_DATE_RE = re.compile(r"\d{1,2}(?:st|nd|rd|th) [A-Z][a-z]+, \d{4}")   # what long_date() prints
+CCY_TAIL_RE = re.compile(r"\s+[A-Z]{3}$")
+
+
+# ============================ helpers ============================
+def _txt(p):
+    return re.sub(r"\s+", " ", p.text or "").strip()
+
+
+def _style_chain(style):
+    while style is not None:
+        yield style
+        style = style.base_style
+
+
+def _doc_default_rpr(doc):
+    rpr = doc.styles.element.find(qn("w:docDefaults") + "/" + qn("w:rPrDefault") + "/" + qn("w:rPr"))
+    return rpr
+
+
+def _eff_size(doc, para, run=None):
+    """Effective font size in pt: run -> paragraph style chain -> document defaults."""
+    if run is not None and run.font.size is not None:
+        return run.font.size.pt
+    for st in _style_chain(para.style):
+        if st.font.size is not None:
+            return st.font.size.pt
+    d = _doc_default_rpr(doc)
+    if d is not None and d.find(qn("w:sz")) is not None:
+        return int(d.find(qn("w:sz")).get(qn("w:val"))) / 2
+    return None
+
+
+def _eff_font(doc, para, run=None):
+    if run is not None and run.font.name:
+        return run.font.name
+    for st in _style_chain(para.style):
+        if st.font.name:
+            return st.font.name
+    d = _doc_default_rpr(doc)
+    if d is not None:
+        rf = d.find(qn("w:rFonts"))
+        if rf is not None:
+            return rf.get(qn("w:ascii")) or rf.get(qn("w:hAnsi"))
+    return None
+
+
+def _eff_bold(para, run=None):
+    if run is not None and run.bold is not None:
+        return run.bold
+    for st in _style_chain(para.style):
+        if st.font.bold is not None:
+            return st.font.bold
+    return False
+
+
+def _first_run(para):
+    return next((r for r in para.runs if r.text.strip()), para.runs[0] if para.runs else None)
+
+
+def _char_scale(para):
+    """Horizontal text scale in % (Word: Font > Advanced > Scale) = <w:w w:val="102"/> in the run properties."""
+    for r in para.runs:
+        if r._r.rPr is not None:
+            w = r._r.rPr.find(qn("w:w"))
+            if w is not None:
+                return int(w.get(qn("w:val")))
+    return None
+
+
+def _line_pt(doc, para):
+    """(points, approximate?) of the paragraph line height. Exact/at-least rules give the real value;
+    a multiple (1.0, 1.15 ...) is converted with font size x 1.15 x multiple (approximation)."""
+    pf = para.paragraph_format
+    ls = pf.line_spacing
+    if ls is None:
+        for st in _style_chain(para.style):
+            if st.paragraph_format.line_spacing is not None:
+                pf, ls = st.paragraph_format, st.paragraph_format.line_spacing
+                break
+    if ls is None:
+        return None, False
+    rule = pf.line_spacing_rule
+    if hasattr(ls, "pt") and rule in (WD_LINE_SPACING.EXACTLY, WD_LINE_SPACING.AT_LEAST, None):
+        return round(ls.pt, 2), rule == WD_LINE_SPACING.AT_LEAST
+    size = _eff_size(doc, para, _first_run(para))
+    if size is None:
+        return None, True
+    mult = ls if not hasattr(ls, "pt") else 1.0
+    return round(size * 1.15 * float(mult), 2), True
+
+
+def _has_page_field(container):
+    return any((el.text or "").strip().upper().startswith("PAGE")
+               for el in container._element.iter(qn("w:instrText"))) or \
+        any((el.get(qn("w:instr")) or "").strip().upper().startswith("PAGE")
+            for el in container._element.iter(qn("w:fldSimple")))
+
+
+def _has_border(para, edge=None):
+    p_pr = para._p.pPr
+    if p_pr is None:
+        return False
+    b = p_pr.find(qn("w:pBdr"))
+    return b is not None and (edge is None or b.find(qn(f"w:{edge}")) is not None)
+
+
+def _cell_widths_cm(table):
+    """Widths of the first row cells (<w:tcW>, twips) - what Word shows in Table Properties."""
+    out = []
+    for c in table.rows[0].cells:
+        tc_w = c._tc.tcPr.find(qn("w:tcW")) if c._tc.tcPr is not None else None
+        if tc_w is None or tc_w.get(qn("w:type")) != "dxa" or not tc_w.get(qn("w:w")):
+            return []
+        out.append(round(int(tc_w.get(qn("w:w"))) / 567.0, 2))
+    return out
+
+
+def _grid_cm(table):
+    grid = table._tbl.find(qn("w:tblGrid"))
+    cols = [] if grid is None else [int(g.get(qn("w:w"))) for g in grid.findall(qn("w:gridCol")) if g.get(qn("w:w"))]
+    return [round(c / 567.0, 2) for c in cols]          # twips -> cm (1 cm = 567 twips)
+
+
+def _cell_border(cell, edge):
+    tc_pr = cell._tc.tcPr
+    if tc_pr is None:
+        return False
+    b = tc_pr.find(qn("w:tcBorders"))
+    if b is None:
+        return False
+    el = b.find(qn(f"w:{edge}"))
+    return el is not None and el.get(qn("w:val")) not in (None, "nil", "none")
+
+
+def _page_break_before(para):
+    p_pr = para._p.pPr
+    return p_pr is not None and p_pr.find(qn("w:pageBreakBefore")) is not None
+
+
+def _differs(a, b):
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) != len(b) or any(_differs(x, y) for x, y in zip(a, b))
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
+        return abs(a - b) > 0.021
+    return a != b
+
+
+# ============================ main ============================
+def extract_output_settings(docx_path):
+    """Returns (output_diff, rows). output_diff = {key: value} for values that differ from the defaults;
+    rows = [(key, found value or None, default, status, comment)] for the report."""
+    doc = Document(str(docx_path))
+    found, comments = {}, {}
+
+    def put(key, value, comment=""):
+        found[key] = value
+        if comment:
+            comments[key] = comment
+
+    sec = doc.sections[0]
+    # ---- page
+    w, h = round(sec.page_width.cm, 1), round(sec.page_height.cm, 1)
+    if abs(w - A4_CM[0]) > 0.2 or abs(h - A4_CM[1]) > 0.2:
+        comments["_page"] = f"page size is {w} x {h} cm, not A4 - the generator always writes A4"
+    put("margins_cm", [round(sec.top_margin.cm, 2), round(sec.bottom_margin.cm, 2),
+                       round(sec.left_margin.cm, 2), round(sec.right_margin.cm, 2)])
+    put("header_distance_cm", round(sec.header_distance.cm, 3))
+    put("footer_distance_cm", round(sec.footer_distance.cm, 3))
+
+    # ---- header
+    title_pg = bool(sec.different_first_page_header_footer)
+    hdr_first = sec.first_page_header if title_pg else sec.header
+    hdr_cont = sec.header
+    lines_first = [_txt(p) for p in hdr_first.paragraphs if _txt(p)]
+    lines_cont = [_txt(p) for p in hdr_cont.paragraphs if _txt(p)]
+    rtype = None
+    if len(lines_first) == 4:
+        put("umbrella", lines_first[0])
+        title = lines_first[2]
+        put("statement_title", title)
+        suffix = ""
+        if title_pg and len(lines_cont) == 4 and lines_cont[2].startswith(title) and len(lines_cont[2]) > len(title):
+            suffix = lines_cont[2][len(title):]
+        if suffix:
+            put("continued_suffix", suffix)
+        elif title_pg:
+            comments["continued_suffix"] = "continuation header has no suffix after the title"
+            put("continued_suffix", "")
+        period = lines_first[3]
+        rtype = "interim" if re.search(r"half[\s-]*year|interim|six months", period, re.I) else "annual"
+        m = DATE_RE.search(period)
+        if m:
+            put("period_line_" + rtype, period[:m.start()] + "{period_long}" + period[m.end():])
+            if not PROGRAM_DATE_RE.fullmatch(m.group(0)):
+                comments["_date"] = (f"the date in the header is written '{m.group(0)}', the program prints "
+                                     f"'31st December, 2025'. Change long_date() in word_builder.py to match.")
+        else:
+            put("period_line_" + rtype, period)
+            comments["period_line_" + rtype] = "no date found in the period line - copied as it is (fixed text)"
+    elif lines_first:
+        comments["_header"] = (f"header has {len(lines_first)} line(s), expected 4 "
+                               "(umbrella / fund / title / period) - header_lines not imported")
+    else:
+        comments["_header"] = "no header text found"
+    hp = next((p for p in hdr_first.paragraphs if _txt(p)), None)
+    if hp is not None:
+        r = _first_run(hp)
+        hs = _eff_size(doc, hp, r)
+        if hs:
+            put("header_font_size", hs)
+        lp, approx = _line_pt(doc, hp)
+        if lp:
+            put("header_line_pt", lp, "approximate (line spacing is a multiple)" if approx else "")
+        put("header_lines_rule", any(_has_border(p) for p in hdr_first.paragraphs))
+
+    # ---- footer
+    ftr = sec.first_page_footer if title_pg else sec.footer
+    has_pn = _has_page_field(ftr) or _has_page_field(sec.footer)
+    put("page_numbers", has_pn)
+    if has_pn:
+        for p in ftr.paragraphs:
+            if _has_page_field(type("C", (), {"_element": p._p})()):
+                for run in p.runs:
+                    if run.font.size:
+                        put("page_number_size", run.font.size.pt)
+                        break
+                break
+    pg = sec._sectPr.find(qn("w:pgNumType"))
+    if pg is not None and pg.get(qn("w:start")):
+        put("first_page_number", int(pg.get(qn("w:start"))))
+
+    # ---- body: intro paragraph + tables
+    body = doc.element.body
+    intro = None
+    for el in body.iterchildren():
+        if el.tag == qn("w:tbl"):
+            break
+        if el.tag == qn("w:p"):
+            t = re.sub(r"\s+", " ", "".join(x.text or "" for x in el.iter(qn("w:t")))).strip()
+            if len(t) >= 80:
+                intro = t
+                break
+    if intro:
+        put("intro_text_" + rtype if rtype else "intro_text", intro)
+    else:
+        comments["_intro"] = "no intro paragraph (80+ characters) before the first table"
+
+    tables = doc.tables
+    if tables:
+        t0 = tables[0]
+        grid = _cell_widths_cm(t0) or _grid_cm(t0)          # cell widths first, table grid as the fallback
+        if len(grid) == 3:
+            put("col_widths_cm", grid)
+        else:
+            comments["_cols"] = f"table 1 has {len(grid)} columns, expected 3 - widths not imported"
+        hdr_cells = [_txt(c.paragraphs[0]) for c in t0.rows[0].cells]
+        if len(hdr_cells) == 3:
+            (put("purchases_title_all" if hdr_cells[0].lower().startswith("total") else "purchases_title", hdr_cells[0]))
+            put("col_nominal", hdr_cells[1])
+            put("col_purchases_amount", CCY_TAIL_RE.sub(" {ccy}", hdr_cells[2]))
+        put("header_rule", any(_cell_border(c, e) for c in t0.rows[0].cells for e in ("top", "bottom")))
+        hp0 = t0.rows[0].cells[0].paragraphs[0]
+        if "header_font_size" not in found:
+            pass
+        # body rows: font / size / line height / scale
+        row = t0.rows[1] if len(t0.rows) > 1 else t0.rows[0]
+        bp = row.cells[0].paragraphs[0]
+        br = _first_run(bp)
+        f = _eff_font(doc, bp, br)
+        if f:
+            put("font", f)
+        s = _eff_size(doc, bp, br)
+        if s:
+            put("font_size", s)
+        lp, approx = _line_pt(doc, bp)
+        if lp:
+            put("line_pt", lp, "approximate (line spacing is a multiple)" if approx else "")
+        cs = _char_scale(bp) or _char_scale(hp0)
+        put("char_scale", cs if cs else 100)
+    else:
+        comments["_tables"] = "no tables found"
+    if len(tables) > 1:
+        hc = [_txt(c.paragraphs[0]) for c in tables[1].rows[0].cells]
+        if len(hc) == 3:
+            put("sales_title_all" if hc[0].lower().startswith("total") else "sales_title", hc[0])
+            put("col_sales_amount", CCY_TAIL_RE.sub(" {ccy}", hc[2]))
+        first_p = tables[1].rows[0].cells[0].paragraphs[0]
+        prev = tables[1]._tbl.getprevious()
+        has_break = _page_break_before(first_p)
+        while prev is not None and prev.tag == qn("w:p") and not has_break:
+            if any(br_.get(qn("w:type")) == "page" for br_ in prev.iter(qn("w:br"))) or \
+                    prev.find(qn("w:pPr") + "/" + qn("w:pageBreakBefore")) is not None:
+                has_break = True
+                break
+            if "".join(x.text or "" for x in prev.iter(qn("w:t"))).strip():
+                break
+            prev = prev.getprevious()
+        put("sales_new_page", "always" if has_break else "fit")
+
+    # ---- result
+    diff = {k: v for k, v in found.items() if _differs(v, DEFAULTS.get(k))}
+    rows = []
+    keys = [k for k in DEFAULTS if k in found]
+    for k in keys:
+        same = not _differs(found[k], DEFAULTS.get(k))
+        rows.append((k, found[k], DEFAULTS.get(k), "same as default" if same else "DIFFERENT",
+                     comments.get(k, "")))
+    for k in DEFAULTS:
+        if k not in found and k not in ("make_pdf", "rows_per_page", "report_type", "header_lines", "umbrella",
+                                         "intro_text_annual", "intro_text_interim", "period_line_annual",
+                                         "period_line_interim", "intro_text"):
+            rows.append((k, None, DEFAULTS[k], "not found (default kept)", ""))
+    for k, c in comments.items():
+        if k.startswith("_"):
+            rows.append((k[1:], None, None, "NOTE", c))
+    return diff, rows
+
+
+def format_report(rows):
+    out = []
+    for k, val, default, status, comment in rows:
+        v = "-" if val is None else (str(val)[:60] + ("..." if len(str(val)) > 60 else ""))
+        d = "" if default is None else (str(default)[:40] + ("..." if len(str(default)) > 40 else ""))
+        line = f"  {k:<22} {status:<24} found: {v}"
+        if status == "DIFFERENT":
+            line += f"   (default: {d})"
+        if comment:
+            line += f"   <- {comment}"
+        out.append(line)
+    return "\n".join(out)
+
+
+def save_client_profile(diff, client, clients_dir):
+    """Writes/updates clients/<client>.json: only the "output" keys found in the Word file are replaced;
+    every other key already in the file (alteryx, matching, name_format ...) is kept."""
+    clients_dir = Path(clients_dir)
+    clients_dir.mkdir(parents=True, exist_ok=True)
+    path = clients_dir / f"{client}.json"
+    data = {}
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("client_name", client)
+    data.setdefault("output", {})
+    data["output"].update(diff)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def import_profile(docx_path, client=None, clients_dir=None, log=print):
+    diff, rows = extract_output_settings(docx_path)
+    log(f"Layout read from {Path(docx_path).name}:")
+    log(format_report(rows))
+    n_diff = len(diff)
+    if client and clients_dir is not None:
+        p = save_client_profile(diff, client, clients_dir)
+        log(f"Saved {n_diff} setting(s) that differ from the defaults -> {p}")
+    else:
+        log(f"{n_diff} setting(s) differ from the defaults (nothing saved - no client name given).")
+    return diff, rows
+
+
+if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    cdir = None
+    if "--clients-dir" in sys.argv:
+        cdir = sys.argv[sys.argv.index("--clients-dir") + 1]
+        args = [a for a in args if a != cdir]
+    if not args:
+        print(__doc__)
+        sys.exit(1)
+    import_profile(args[0], args[1] if len(args) > 1 else None, cdir or (Path(__file__).parent / "clients"))

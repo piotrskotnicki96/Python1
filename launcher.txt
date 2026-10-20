@@ -24,11 +24,12 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, simpledialog
 
 import soi_pdf_parser as soi
 import matcher
 import word_builder
+import profile_import
 
 # Folder with clients/, data/, output/. Built as .exe (PyInstaller) __file__ points into the program's
 # internal/temp folder, so data would be lost or hidden there: use the folder of the .exe instead.
@@ -156,7 +157,8 @@ class Launcher(tk.Tk):
         self.b4 = ttk.Button(btns, text="Save approved names → mappings", command=self._on_save_mappings)
         self.b5 = ttk.Button(btns, text="Save fund map", command=self._on_save_fund_map)
         self.b3 = ttk.Button(btns, text="3. Generate Word / PDF", command=self._on_word)
-        for b in (self.b1, self.b2, self.b4, self.b5, self.b3):
+        self.b6 = ttk.Button(btns, text="Layout from Word → profile", command=self._on_import_word)
+        for b in (self.b1, self.b2, self.b4, self.b5, self.b3, self.b6):
             b.pack(side="left", expand=True, fill="x", padx=3)
 
         self.log = tk.Text(frm, height=16, state="disabled", wrap="word")
@@ -222,7 +224,7 @@ class Launcher(tk.Tk):
         err = save_settings(snap)
         if err:
             self._log(f"WARNING: {err}")
-        for b in (self.b1, self.b2, self.b4, self.b5, self.b3):
+        for b in (self.b1, self.b2, self.b4, self.b5, self.b3, self.b6):
             b.configure(state="disabled")
 
         def worker():
@@ -232,7 +234,7 @@ class Launcher(tk.Tk):
                 self._log(f"ERROR: {e}")
                 self._log(traceback.format_exc())
             finally:
-                self.after(0, lambda: [b.configure(state="normal") for b in (self.b1, self.b2, self.b4, self.b5, self.b3)])
+                self.after(0, lambda: [b.configure(state="normal") for b in (self.b1, self.b2, self.b4, self.b5, self.b3, self.b6)])
         threading.Thread(target=worker, daemon=True).start()
 
     def step_soi(self, snap):
@@ -294,6 +296,26 @@ class Launcher(tk.Tk):
                                        initialdir=str(self._out_dir()), filetypes=[("Excel", "*.xlsx")])
         if p:
             self._run(lambda snap: self.step_word(snap, p))
+
+    def _on_import_word(self):
+        p = filedialog.askopenfilename(title="Word note to read the layout from (e.g. last year's note)",
+                                       filetypes=[("Word", "*.docx")])
+        if not p:
+            return
+        cur = self.client_var.get()
+        name = simpledialog.askstring("Client profile",
+                                      "Save the layout to clients/<name>.json\n(an existing file keeps its other settings).\n\nClient name:",
+                                      initialvalue="" if cur == DEFAULT_CLIENT else cur, parent=self)
+        name = "".join(ch for ch in (name or "") if ch.isalnum() or ch in " _-").strip()
+        if not name or name == "_template":
+            self._log("Layout import cancelled (no valid client name).")
+            return
+        self._run(lambda snap: self.step_import_word(p, name))
+
+    def step_import_word(self, docx_path, client):
+        profile_import.import_profile(docx_path, client, CLIENTS_DIR, log=self._log)
+        self.after(0, self._refresh_clients)
+        self._log(f"Pick client '{client}' in the list to use it. Check the 'DIFFERENT' lines above and generate a test note.")
 
     def step_word(self, snap, review_path):
         if not snap["period"].strip():
