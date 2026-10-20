@@ -26,6 +26,8 @@ import sys
 from pathlib import Path
 
 from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from docx.enum.text import WD_LINE_SPACING
 from docx.oxml.ns import qn
 
@@ -39,8 +41,42 @@ CCY_TAIL_RE = re.compile(r"\s+[A-Z]{3}$")
 
 
 # ============================ helpers ============================
+def _own_text(p_el):
+    """Text of a <w:p> WITHOUT the text of paragraphs nested in it (text boxes) - those are read on their own."""
+    parts = []
+    for t in p_el.iter(qn("w:t")):
+        anc = t.getparent()
+        while anc is not None and anc.tag != qn("w:p"):
+            anc = anc.getparent()
+        if anc is p_el:
+            parts.append(t.text or "")
+    return re.sub(r"\s+", " ", "".join(parts)).strip()
+
+
 def _txt(p):
-    return re.sub(r"\s+", " ", p.text or "").strip()
+    """Paragraph text read from the XML (also text inside content controls, fields, hyperlinks)."""
+    return _own_text(p._p)
+
+
+def _paras(container):
+    """ALL paragraphs of a header/footer, also those inside content controls, tables and text boxes."""
+    return [Paragraph(p, container) for p in container._element.iter(qn("w:p"))]
+
+
+def _all_tables(doc):
+    """ALL top-level tables of the body, also those inside content controls (Word 'Rich text' controls, which
+    document.tables does not return)."""
+    out = []
+    for t in doc.element.body.iter(qn("w:tbl")):
+        anc, nested = t.getparent(), False
+        while anc is not None:
+            if anc.tag == qn("w:tbl"):
+                nested = True
+                break
+            anc = anc.getparent()
+        if not nested:
+            out.append(Table(t, doc._body))
+    return out
 
 
 def _style_chain(style):
@@ -174,6 +210,27 @@ def _page_break_before(para):
     return p_pr is not None and p_pr.find(qn("w:pageBreakBefore")) is not None
 
 
+RANGES = {"font_size": (6, 16), "header_font_size": (6, 16), "page_number_size": (6, 16), "line_pt": (8, 24),
+          "header_line_pt": (8, 24), "char_scale": (80, 120), "header_distance_cm": (0.2, 4),
+          "footer_distance_cm": (0.2, 5), "first_page_number": (1, 5000)}
+
+
+def _plausible(key, value):
+    """(ok, reason). A real note has sane values; garbage (1 pt font, 0.7 cm margins, wrong table) is ignored."""
+    if key in RANGES:
+        lo, hi = RANGES[key]
+        if not (lo <= float(value) <= hi):
+            return False, f"{value} is outside the plausible range {lo}-{hi}"
+    if key == "margins_cm":
+        top, bottom, left, right = value
+        if not (1 <= top <= 8 and 1 <= bottom <= 8 and 1 <= left <= 6 and 1 <= right <= 6):
+            return False, f"margins {value} are not plausible for this note (top/bottom 1-8 cm, left/right 1-6 cm)"
+    if key == "col_widths_cm":
+        if any(not (1 <= x <= 16) for x in value) or not (12 <= sum(value) <= 19):
+            return False, f"column widths {value} (sum {sum(value):.1f} cm) are not plausible (sum 12-19 cm)"
+    return True, ""
+
+
 def _differs(a, b):
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
         return len(a) != len(b) or any(_differs(x, y) for x, y in zip(a, b))
@@ -187,9 +244,13 @@ def extract_output_settings(docx_path):
     """Returns (output_diff, rows). output_diff = {key: value} for values that differ from the defaults;
     rows = [(key, found value or None, default, status, comment)] for the report."""
     doc = Document(str(docx_path))
-    found, comments = {}, {}
+    found, comments, rejected = {}, {}, {}
 
     def put(key, value, comment=""):
+        ok, why = _plausible(key, value)
+        if not ok:
+            rejected[key] = (value, why)
+            return
         found[key] = value
         if comment:
             comments[key] = comment
@@ -208,8 +269,8 @@ def extract_output_settings(docx_path):
     title_pg = bool(sec.different_first_page_header_footer)
     hdr_first = sec.first_page_header if title_pg else sec.header
     hdr_cont = sec.header
-    lines_first = [_txt(p) for p in hdr_first.paragraphs if _txt(p)]
-    lines_cont = [_txt(p) for p in hdr_cont.paragraphs if _txt(p)]
+    lines_first = [_txt(p) for p in _paras(hdr_first) if _txt(p)]
+    lines_cont = [_txt(p) for p in _paras(hdr_cont) if _txt(p)]
     rtype = None
     if len(lines_first) == 4:
         put("umbrella", lines_first[0])
@@ -239,7 +300,7 @@ def extract_output_settings(docx_path):
                                "(umbrella / fund / title / period) - header_lines not imported")
     else:
         comments["_header"] = "no header text found"
-    hp = next((p for p in hdr_first.paragraphs if _txt(p)), None)
+    hp = next((p for p in _paras(hdr_first) if _txt(p)), None)
     if hp is not None:
         r = _first_run(hp)
         hs = _eff_size(doc, hp, r)
@@ -248,14 +309,14 @@ def extract_output_settings(docx_path):
         lp, approx = _line_pt(doc, hp)
         if lp:
             put("header_line_pt", lp, "approximate (line spacing is a multiple)" if approx else "")
-        put("header_lines_rule", any(_has_border(p) for p in hdr_first.paragraphs))
+        put("header_lines_rule", any(_has_border(p) for p in _paras(hdr_first)))
 
     # ---- footer
     ftr = sec.first_page_footer if title_pg else sec.footer
     has_pn = _has_page_field(ftr) or _has_page_field(sec.footer)
     put("page_numbers", has_pn)
     if has_pn:
-        for p in ftr.paragraphs:
+        for p in _paras(ftr):
             if _has_page_field(type("C", (), {"_element": p._p})()):
                 for run in p.runs:
                     if run.font.size:
@@ -266,76 +327,120 @@ def extract_output_settings(docx_path):
     if pg is not None and pg.get(qn("w:start")):
         put("first_page_number", int(pg.get(qn("w:start"))))
 
-    # ---- body: intro paragraph + tables
-    body = doc.element.body
+    # ---- body: find the Major Purchases / Major Sales tables by their header text (not by position)
+    tables = _all_tables(doc)
+
+    def kind(t):
+        try:
+            txt = " ".join(_txt(c.paragraphs[0]) for c in t.rows[0].cells).lower()
+        except IndexError:
+            return None
+        return "P" if "purchases" in txt else ("S" if "sales" in txt else None)
+
+    tp = next((t for t in tables if kind(t) == "P"), None)
+    ts, after = None, tp is None
+    for t in tables:
+        if tp is not None and t._tbl is tp._tbl:
+            after = True
+            continue
+        if after and kind(t) == "S":
+            ts = t
+            break
+    first = tp if tp is not None else ts
+    no_note = first is None
+    if no_note:
+        comments["_tables"] = ("no 'Major Purchases' / 'Major Sales' table found - this Word does not look like the "
+                               "note, so NOTHING will be saved")
+    # intro paragraph = first long paragraph (outside tables) before the first note table, in document order
     intro = None
-    for el in body.iterchildren():
-        if el.tag == qn("w:tbl"):
+    stop = first._tbl if first is not None else None
+    for el in doc.element.body.iter():
+        if el is stop or (stop is None and el.tag == qn("w:tbl")):
             break
         if el.tag == qn("w:p"):
-            t = re.sub(r"\s+", " ", "".join(x.text or "" for x in el.iter(qn("w:t")))).strip()
-            if len(t) >= 80:
+            anc, in_tbl = el.getparent(), False
+            while anc is not None:
+                if anc.tag == qn("w:tbl"):
+                    in_tbl = True
+                    break
+                anc = anc.getparent()
+            t = _own_text(el)
+            if not in_tbl and len(t) >= 80:
                 intro = t
                 break
     if intro:
         put("intro_text_" + rtype if rtype else "intro_text", intro)
-    else:
-        comments["_intro"] = "no intro paragraph (80+ characters) before the first table"
+    elif not no_note:
+        comments["_intro"] = "no intro paragraph (80+ characters) before the first Major Purchases/Sales table"
 
-    tables = doc.tables
-    if tables:
-        t0 = tables[0]
-        grid = _cell_widths_cm(t0) or _grid_cm(t0)          # cell widths first, table grid as the fallback
+    if tp is not None:
+        grid = _cell_widths_cm(tp) or _grid_cm(tp)          # cell widths first, table grid as the fallback
         if len(grid) == 3:
             put("col_widths_cm", grid)
         else:
-            comments["_cols"] = f"table 1 has {len(grid)} columns, expected 3 - widths not imported"
-        hdr_cells = [_txt(c.paragraphs[0]) for c in t0.rows[0].cells]
+            comments["_cols"] = f"the Major Purchases table has {len(grid)} columns, expected 3 - widths not imported"
+        hdr_cells = [_txt(c.paragraphs[0]) for c in tp.rows[0].cells]
         if len(hdr_cells) == 3:
-            (put("purchases_title_all" if hdr_cells[0].lower().startswith("total") else "purchases_title", hdr_cells[0]))
+            put("purchases_title_all" if hdr_cells[0].lower().startswith("total") else "purchases_title", hdr_cells[0])
             put("col_nominal", hdr_cells[1])
             put("col_purchases_amount", CCY_TAIL_RE.sub(" {ccy}", hdr_cells[2]))
-        put("header_rule", any(_cell_border(c, e) for c in t0.rows[0].cells for e in ("top", "bottom")))
-        hp0 = t0.rows[0].cells[0].paragraphs[0]
-        if "header_font_size" not in found:
-            pass
-        # body rows: font / size / line height / scale
-        row = t0.rows[1] if len(t0.rows) > 1 else t0.rows[0]
-        bp = row.cells[0].paragraphs[0]
-        br = _first_run(bp)
-        f = _eff_font(doc, bp, br)
-        if f:
-            put("font", f)
-        s = _eff_size(doc, bp, br)
-        if s:
-            put("font_size", s)
-        lp, approx = _line_pt(doc, bp)
-        if lp:
-            put("line_pt", lp, "approximate (line spacing is a multiple)" if approx else "")
-        cs = _char_scale(bp) or _char_scale(hp0)
-        put("char_scale", cs if cs else 100)
-    else:
-        comments["_tables"] = "no tables found"
-    if len(tables) > 1:
-        hc = [_txt(c.paragraphs[0]) for c in tables[1].rows[0].cells]
+        put("header_rule", any(_cell_border(c, e) for c in tp.rows[0].cells for e in ("top", "bottom")))
+        hp0 = tp.rows[0].cells[0].paragraphs[0]
+        # body row = first row after the header whose name cell has text and a real font size (skip spacer rows)
+        bp = None
+        for row in tp.rows[1:]:
+            cand = row.cells[0].paragraphs[0]
+            if _txt(cand) and (_eff_size(doc, cand, _first_run(cand)) or 0) >= 5:
+                bp = cand
+                break
+        if bp is not None:
+            br = _first_run(bp)
+            f = _eff_font(doc, bp, br)
+            if f:
+                put("font", f)
+            sz = _eff_size(doc, bp, br)
+            if sz:
+                put("font_size", sz)
+            lp, approx = _line_pt(doc, bp)
+            if lp:
+                put("line_pt", lp, "approximate (line spacing is a multiple)" if approx else "")
+            cs = _char_scale(bp) or _char_scale(hp0)
+            put("char_scale", cs if cs else 100)
+        else:
+            comments["_body"] = "no data row with a name found in the Major Purchases table - font/line height not imported"
+    if ts is not None:
+        hc = [_txt(c.paragraphs[0]) for c in ts.rows[0].cells]
         if len(hc) == 3:
             put("sales_title_all" if hc[0].lower().startswith("total") else "sales_title", hc[0])
             put("col_sales_amount", CCY_TAIL_RE.sub(" {ccy}", hc[2]))
-        first_p = tables[1].rows[0].cells[0].paragraphs[0]
-        prev = tables[1]._tbl.getprevious()
-        has_break = _page_break_before(first_p)
-        while prev is not None and prev.tag == qn("w:p") and not has_break:
-            if any(br_.get(qn("w:type")) == "page" for br_ in prev.iter(qn("w:br"))) or \
-                    prev.find(qn("w:pPr") + "/" + qn("w:pageBreakBefore")) is not None:
-                has_break = True
-                break
-            if "".join(x.text or "" for x in prev.iter(qn("w:t"))).strip():
-                break
-            prev = prev.getprevious()
-        put("sales_new_page", "always" if has_break else "fit")
+        if tp is not None:
+            first_p = ts.rows[0].cells[0].paragraphs[0]
+            prev = ts._tbl.getprevious()
+            has_break = _page_break_before(first_p)
+            while prev is not None and prev.tag == qn("w:p") and not has_break:
+                if any(br_.get(qn("w:type")) == "page" for br_ in prev.iter(qn("w:br"))) or \
+                        prev.find(qn("w:pPr") + "/" + qn("w:pageBreakBefore")) is not None:
+                    has_break = True
+                    break
+                if "".join(x.text or "" for x in prev.iter(qn("w:t"))).strip():
+                    break
+                prev = prev.getprevious()
+            put("sales_new_page", "always" if has_break else "fit")
+
+    if not lines_first:      # a Word without a page header (web export, plain document): header/footer facts say nothing
+        for k in ("header_distance_cm", "footer_distance_cm", "page_numbers", "page_number_size",
+                  "first_page_number", "header_lines_rule", "header_font_size", "header_line_pt"):
+            found.pop(k, None)
+        comments["_headerless"] = "no page header text found - header/footer settings (distances, page numbers) not imported"
 
     # ---- result
     diff = {k: v for k, v in found.items() if _differs(v, DEFAULTS.get(k))}
+    if no_note:
+        diff = {}
+    elif len(rejected) >= 3:
+        comments["_implausible"] = (f"{len(rejected)} values were implausible - this Word does not look like a normal "
+                                    "note layout (for example a web export), so NOTHING will be saved")
+        diff = {}
     rows = []
     keys = [k for k in DEFAULTS if k in found]
     for k in keys:
@@ -347,6 +452,8 @@ def extract_output_settings(docx_path):
                                          "intro_text_annual", "intro_text_interim", "period_line_annual",
                                          "period_line_interim", "intro_text"):
             rows.append((k, None, DEFAULTS[k], "not found (default kept)", ""))
+    for k, (v, why) in rejected.items():
+        rows.append((k, v, DEFAULTS.get(k), "IGNORED (implausible)", why))
     for k, c in comments.items():
         if k.startswith("_"):
             rows.append((k[1:], None, None, "NOTE", c))
@@ -376,6 +483,7 @@ def save_client_profile(diff, client, clients_dir):
     data = {}
     if path.exists():
         data = json.loads(path.read_text(encoding="utf-8"))
+        path.with_suffix(".json.bak").write_text(path.read_text(encoding="utf-8"), encoding="utf-8")  # backup
     data.setdefault("client_name", client)
     data.setdefault("output", {})
     data["output"].update(diff)
@@ -388,11 +496,11 @@ def import_profile(docx_path, client=None, clients_dir=None, log=print):
     log(f"Layout read from {Path(docx_path).name}:")
     log(format_report(rows))
     n_diff = len(diff)
-    if client and clients_dir is not None:
+    if client and clients_dir is not None and diff:
         p = save_client_profile(diff, client, clients_dir)
         log(f"Saved {n_diff} setting(s) that differ from the defaults -> {p}")
     else:
-        log(f"{n_diff} setting(s) differ from the defaults (nothing saved - no client name given).")
+        log(f"{n_diff} setting(s) differ from the defaults - nothing saved.")
     return diff, rows
 
 

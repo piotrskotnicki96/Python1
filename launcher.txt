@@ -24,7 +24,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog
+from tkinter import ttk, filedialog, simpledialog, messagebox
 
 import soi_pdf_parser as soi
 import matcher
@@ -313,9 +313,26 @@ class Launcher(tk.Tk):
         self._run(lambda snap: self.step_import_word(p, name))
 
     def step_import_word(self, docx_path, client):
-        profile_import.import_profile(docx_path, client, CLIENTS_DIR, log=self._log)
-        self.after(0, self._refresh_clients)
-        self._log(f"Pick client '{client}' in the list to use it. Check the 'DIFFERENT' lines above and generate a test note.")
+        diff, rows = profile_import.extract_output_settings(docx_path)
+        self._log(f"Layout read from {Path(docx_path).name}:")
+        self._log(profile_import.format_report(rows))
+        if not diff:
+            self._log("Nothing to save (no differences from the defaults, or the file does not look like the note).")
+            return
+        self.after(0, lambda: self._confirm_save_profile(diff, client))
+
+    def _confirm_save_profile(self, diff, client):
+        """Runs on the main thread: the user sees what would be written and decides."""
+        lines = "\n".join(f"{k}: {str(v)[:60]}" for k, v in diff.items())
+        if messagebox.askyesno("Save layout to profile",
+                               f"Save {len(diff)} setting(s) to clients/{client}.json?\n"
+                               f"(an existing file is backed up as {client}.json.bak)\n\n{lines}", parent=self):
+            p = profile_import.save_client_profile(diff, client, CLIENTS_DIR)
+            self._log(f"Saved {len(diff)} setting(s) -> {p}")
+            self._refresh_clients()
+            self._log(f"Pick client '{client}' in the list and generate a test note.")
+        else:
+            self._log("Layout NOT saved.")
 
     def step_word(self, snap, review_path):
         if not snap["period"].strip():
