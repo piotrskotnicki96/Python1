@@ -215,6 +215,65 @@ RANGES = {"font_size": (6, 16), "header_font_size": (6, 16), "page_number_size":
           "footer_distance_cm": (0.2, 5), "first_page_number": (1, 5000)}
 
 
+_CM = 28.3465
+_TEXT_TOP_OFFSET_CM = 0.12      # text top of the first table row sits ~0.12 cm below the body start (calibrated on a generated note)
+_TEXT_BOTTOM_SLACK_CM = 0.10
+
+
+def measure_margins_from_pdf(docx_path):
+    """Renders the note to PDF (Word if available, else LibreOffice; always from a temp copy) and measures where the
+    table text really sits: top/bottom/left/right distances in cm. This is the EFFECTIVE layout - Word pushes the body
+    below a tall header even when the page-setup top margin is tiny (typical for Confluence exports: top 0.71 cm).
+    Returns (dict | None, message)."""
+    import shutil, tempfile
+    try:
+        import pdfplumber
+    except ImportError:
+        return None, "pdfplumber not available"
+    tmp = Path(tempfile.mkdtemp(prefix="ps_measure_"))
+    try:
+        src = tmp / "note.docx"
+        shutil.copyfile(str(docx_path), src)
+        pdf = word_builder.to_pdf(src, log=lambda *a: None)
+        if not pdf:
+            return None, "could not render the Word file to PDF (no Word/LibreOffice)"
+        tops, bottoms, lefts, rights = [], [], [], []
+        with pdfplumber.open(pdf) as doc:
+            for pg in doc.pages[:14]:
+                words = pg.extract_words()
+                if not words:
+                    continue
+                heads = [w for w in words if w["text"].lower() in ("major", "total")
+                         and any(v["text"].lower() in ("purchases", "sales") and abs(v["top"] - w["top"]) < 2
+                                 and 0 < v["x0"] - w["x1"] < 12 for v in words)]
+                if not heads:
+                    continue
+                # table area = from the first table header down; drop a lone page-number line at the very bottom
+                body = [w for w in words if w["top"] >= min(h["top"] for h in heads) - 1]
+                lines = {}
+                for w in body:
+                    lines.setdefault(round(w["top"]), []).append(w)
+                last = max(lines)
+                if len(lines[last]) == 1 and lines[last][0]["text"].isdigit() and len(lines) > 3:
+                    del lines[last]
+                body = [w for ln in lines.values() for w in ln]
+                tops.append(min(h["top"] for h in heads))
+                if len(lines) >= 45:            # only an (almost) full page says where the body area really ends
+                    bottoms.append(pg.height - max(w["bottom"] for w in body))
+                lefts.append(min(w["x0"] for w in body))
+                rights.append(pg.width - max(w["x1"] for w in body))
+        if not tops:
+            return None, "no Purchases/Sales table header found in the rendered PDF"
+        res = {"top": round(min(tops) / _CM - _TEXT_TOP_OFFSET_CM, 2),
+               "bottom": round(min(bottoms) / _CM - _TEXT_BOTTOM_SLACK_CM, 2) if bottoms else None,
+               "left": round(min(lefts) / _CM, 2), "right": round(min(rights) / _CM, 2), "pages": len(tops)}
+        return res, f"measured on {len(tops)} page(s) of the rendered PDF"
+    except Exception as e:  # noqa: BLE001 - measuring is optional
+        return None, f"measuring failed: {e}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 _NOTE_HDR_RE = re.compile(r"^\s*(major|total)\s+(purchases|sales)\b", re.I)
 
 
@@ -253,8 +312,8 @@ def _plausible(key, value):
             return False, f"{value} is outside the plausible range {lo}-{hi}"
     if key == "margins_cm":
         top, bottom, left, right = value
-        if not (1 <= top <= 8 and 1 <= bottom <= 8 and 1 <= left <= 6 and 1 <= right <= 6):
-            return False, f"margins {value} are not plausible for this note (top/bottom 1-8 cm, left/right 1-6 cm)"
+        if not (0.3 <= top <= 8 and 0.3 <= bottom <= 8 and 0.5 <= left <= 6 and 0.5 <= right <= 6):
+            return False, f"margins {value} are not plausible for this note (top/bottom 0.3-8 cm, left/right 0.5-6 cm)"
     if key == "col_widths_cm":
         if any(not (1 <= x <= 16) for x in value) or not (12 <= sum(value) <= 19):
             return False, f"column widths {value} (sum {sum(value):.1f} cm) are not plausible (sum 12-19 cm)"
@@ -270,7 +329,7 @@ def _differs(a, b):
 
 
 # ============================ main ============================
-def extract_output_settings(docx_path):
+def extract_output_settings(docx_path, measure=True):
     """Returns (output_diff, rows). output_diff = {key: value} for values that differ from the defaults;
     rows = [(key, found value or None, default, status, comment)] for the report."""
     doc = Document(str(docx_path))
@@ -293,7 +352,25 @@ def extract_output_settings(docx_path):
     w, h = round(sec.page_width.cm, 1), round(sec.page_height.cm, 1)
     if abs(w - A4_CM[0]) > 0.2 or abs(h - A4_CM[1]) > 0.2:
         comments["_page"] = f"page size is {w} x {h} cm, not A4 - the generator always writes A4"
-    put("margins_cm", _margins_cm(sec))
+    raw_m = _margins_cm(sec)
+    margins = list(raw_m)
+    if measure:
+        got, msg = measure_margins_from_pdf(docx_path)
+        if got:
+            # top/bottom: the body may start lower than the page-setup margin (tall header) -> use what is really there
+            # left/right: the page-setup values are exact (the table width says nothing about them)
+            for i, key in ((0, "top"), (1, "bottom")):
+                if got[key] is not None and got[key] - raw_m[i] > 0.2:
+                    margins[i] = round(got[key], 2)
+            if margins != raw_m:
+                comments["margins_cm"] = (f"page setup says {raw_m}, but the table text really starts/ends at "
+                                          f"top {got['top']} / bottom {got['bottom']} cm ({msg}) - effective values used "
+                                          "(the header pushes the body down)")
+            else:
+                comments["margins_cm"] = f"checked against the rendered PDF ({msg}): page setup matches"
+        else:
+            comments["_measure"] = f"margins not verified on a rendered PDF: {msg}"
+    put("margins_cm", margins)
     put("header_distance_cm", round(sec.header_distance.cm, 3))
     put("footer_distance_cm", round(sec.footer_distance.cm, 3))
 
@@ -515,7 +592,13 @@ def describe_structure(docx_path):
     out.append(f"page {sec.page_width.cm:.1f} x {sec.page_height.cm:.1f} cm | sections: {len(doc.sections)} | "
                f"different first page: {bool(sec.different_first_page_header_footer)}")
     ni = _note_section_index(doc)
+    shown = set(range(min(3, len(doc.sections)))) | {ni}
+    if len(doc.sections) > len(shown):
+        out.append(f"  (sections: {len(doc.sections)}; first 3 and the note section shown, "
+                   f"{len({_margins_cm(x) and tuple(_margins_cm(x)) for x in doc.sections})} distinct margin set(s) in total)")
     for i, sc in enumerate(doc.sections):
+        if i not in shown:
+            continue
         out.append(f"  section {i + 1}{' <- note tables start here' if i == ni else ''}: margins top/bottom/left/right "
                    f"{_margins_cm(sc)} cm | raw {[round(x.cm, 2) for x in (sc.top_margin, sc.bottom_margin, sc.left_margin, sc.right_margin)]}"
                    f" | header/footer distance {round(sc.header_distance.cm, 2)}/{round(sc.footer_distance.cm, 2)}"
