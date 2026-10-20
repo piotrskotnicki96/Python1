@@ -160,6 +160,10 @@ class Launcher(tk.Tk):
         self.b6 = ttk.Button(btns, text="Layout from Word → profile", command=self._on_import_word)
         for b in (self.b1, self.b2, self.b4, self.b5, self.b3, self.b6):
             b.pack(side="left", expand=True, fill="x", padx=3)
+        ttk.Label(btns, text="Sales on new page:").pack(side="left", padx=(10, 2))
+        self.sales_layout = tk.StringVar(value="(profile)")
+        ttk.Combobox(btns, textvariable=self.sales_layout, width=9, state="readonly",
+                     values=["(profile)", "always", "auto", "fit"]).pack(side="left")
 
         self.log = tk.Text(frm, height=16, state="disabled", wrap="word")
         self.log.grid(row=9, column=0, columnspan=3, sticky="nsew")
@@ -202,6 +206,7 @@ class Launcher(tk.Tk):
         """All field values, read ONCE on the main thread when a step starts. The worker thread uses only this
         copy, so changing the client/period/paths while a step runs cannot mix two clients' inputs."""
         return {"client": self.client_var.get(), "period": self.period_var.get(),
+                "sales_layout": self.sales_layout.get(),
                 **{k: v.get() for k, v in self.vars.items()}}
 
     def _profile(self, snap):
@@ -210,6 +215,8 @@ class Launcher(tk.Tk):
         path = self.clients.get(snap["client"])
         if path:
             deep_merge(prof, json.loads(path.read_text(encoding="utf-8")))
+        if snap.get("sales_layout") in ("always", "auto", "fit"):      # dropdown overrides the profile
+            prof.setdefault("output", {})["sales_new_page"] = snap["sales_layout"]
         return prof
 
     def _out_dir(self, snap=None):
@@ -316,6 +323,11 @@ class Launcher(tk.Tk):
         diff, rows = profile_import.extract_output_settings(docx_path)
         self._log(f"Layout read from {Path(docx_path).name}:")
         self._log(profile_import.format_report(rows))
+        try:
+            self._log("Structure of the Word file (send this when the layout is read wrongly):\n"
+                      + profile_import.describe_structure(docx_path))
+        except Exception as e:                       # the dump is only a diagnostic aid
+            self._log(f"(structure dump failed: {e})")
         if not diff:
             self._log("Nothing to save (no differences from the defaults, or the file does not look like the note).")
             return

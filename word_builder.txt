@@ -91,7 +91,10 @@ OUTPUT_DEFAULTS = {
     "margins_cm": [4.46, 3.4, 2.07, 2.07],   # top, bottom, left, right (top leaves room for the page header)
     "header_distance_cm": 0.814,
     "footer_distance_cm": 2.85,
-    "sales_new_page": "always",             # "always" = Sales starts on its own page (as in the real report); "fit" = after Purchases if it fits
+    "sales_new_page": "always",             # "always" = Sales starts on its own page (as in the real report);
+                                            # "auto" = new page only when Purchases + Sales would fill more than auto_fill_ratio of one page (too crowded);
+                                            # "fit" = after Purchases whenever it fits
+    "auto_fill_ratio": 0.8,                 # "auto": max share of a page Purchases + Sales may fill together
     "rows_per_page": 55,                     # estimate used only to decide "Sales on a new page"
     "make_pdf": True,
 }
@@ -505,6 +508,7 @@ def build_note(review_path, out_docx, profile=None, period="", fund_map_path=Non
         if k == 0 and intro:
             _para(doc, intro.format(**repl), cfg, align=WD_ALIGN_PARAGRAPH.JUSTIFY, space_after=12)
         purchases_lines = 0
+        intro_lines = (math.ceil(len(intro.format(**repl)) / 95) + 1) if (k == 0 and intro) else 0
         for side, title_key, col_key in (("Purchases", "purchases_title", "col_purchases_amount"),
                                          ("Sales", "sales_title", "col_sales_amount")):
             s = g[g["Side"] == side].copy()
@@ -523,7 +527,9 @@ def build_note(review_path, out_docx, profile=None, period="", fund_map_path=Non
             else:
                 # longer than a page -> always a new page; otherwise Word keeps it together and moves it
                 # to the next page only when it does not fit under Purchases
-                new_page = purchases_lines > 0 and (cfg.get("sales_new_page", "always") == "always"
+                mode = cfg.get("sales_new_page", "always")
+                crowded = (intro_lines + purchases_lines + 1 + lines) > cfg["rows_per_page"] * float(cfg.get("auto_fill_ratio", 0.8))
+                new_page = purchases_lines > 0 and (mode == "always" or (mode == "auto" and crowded)
                                                     or lines > cfg["rows_per_page"] - 2)
                 _add_side(doc, rows, title, cfg[col_key].format(**repl), cfg,
                           keep_together=not new_page, page_break=new_page)

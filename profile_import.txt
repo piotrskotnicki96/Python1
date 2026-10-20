@@ -215,6 +215,36 @@ RANGES = {"font_size": (6, 16), "header_font_size": (6, 16), "page_number_size":
           "footer_distance_cm": (0.2, 5), "first_page_number": (1, 5000)}
 
 
+_NOTE_HDR_RE = re.compile(r"^\s*(major|total)\s+(purchases|sales)\b", re.I)
+
+
+def _note_section_index(doc):
+    """Index of the Word section that holds the first Purchases/Sales table (a Confluence/Kofax export often has
+    a cover or other section first, with different margins). A section ends at a paragraph carrying <w:sectPr>;
+    the last section's sectPr sits at the end of the body. Returns 0 when no note table is found."""
+    idx = 0
+    for child in doc.element.body:
+        for tbl in ([child] if child.tag == qn("w:tbl") else list(child.iter(qn("w:tbl")))):
+            first_p = next(iter(tbl.iter(qn("w:p"))), None)
+            if first_p is not None and _NOTE_HDR_RE.match(_own_text(first_p) or ""):
+                return min(idx, len(doc.sections) - 1)
+        if child.tag == qn("w:p") and child.find(qn("w:pPr") + "/" + qn("w:sectPr")) is not None:
+            idx += 1
+    return 0
+
+
+def _margins_cm(sec):
+    """top, bottom, left, right in cm; the binding gutter (<w:pgMar w:gutter>) is added to the left margin
+    - this is how Word really lays the page out."""
+    pm = sec._sectPr.find(qn("w:pgMar"))
+    gut = int(pm.get(qn("w:gutter")) or 0) / 567.0 if pm is not None else 0.0
+    top, bottom, left, right = (round(sec.top_margin.cm, 2), round(sec.bottom_margin.cm, 2),
+                                round(sec.left_margin.cm, 2), round(sec.right_margin.cm, 2))
+    if gut:
+        left += gut
+    return [round(top, 2), round(bottom, 2), round(left, 2), round(right, 2)]
+
+
 def _plausible(key, value):
     """(ok, reason). A real note has sane values; garbage (1 pt font, 0.7 cm margins, wrong table) is ignored."""
     if key in RANGES:
@@ -255,13 +285,15 @@ def extract_output_settings(docx_path):
         if comment:
             comments[key] = comment
 
-    sec = doc.sections[0]
+    sec_i = _note_section_index(doc)
+    sec = doc.sections[sec_i]
+    if sec_i:
+        comments["_section"] = f"the note starts in section {sec_i + 1} of {len(doc.sections)} - page layout read from that section"
     # ---- page
     w, h = round(sec.page_width.cm, 1), round(sec.page_height.cm, 1)
     if abs(w - A4_CM[0]) > 0.2 or abs(h - A4_CM[1]) > 0.2:
         comments["_page"] = f"page size is {w} x {h} cm, not A4 - the generator always writes A4"
-    put("margins_cm", [round(sec.top_margin.cm, 2), round(sec.bottom_margin.cm, 2),
-                       round(sec.left_margin.cm, 2), round(sec.right_margin.cm, 2)])
+    put("margins_cm", _margins_cm(sec))
     put("header_distance_cm", round(sec.header_distance.cm, 3))
     put("footer_distance_cm", round(sec.footer_distance.cm, 3))
 
@@ -474,6 +506,47 @@ def format_report(rows):
     return "\n".join(out)
 
 
+def describe_structure(docx_path):
+    """Short structural dump (no long texts) to find out why a Word is read wrongly: tables with their header row,
+    widths and whether they sit inside a content control, header/footer contents."""
+    doc = Document(str(docx_path))
+    out = []
+    sec = doc.sections[0]
+    out.append(f"page {sec.page_width.cm:.1f} x {sec.page_height.cm:.1f} cm | sections: {len(doc.sections)} | "
+               f"different first page: {bool(sec.different_first_page_header_footer)}")
+    ni = _note_section_index(doc)
+    for i, sc in enumerate(doc.sections):
+        out.append(f"  section {i + 1}{' <- note tables start here' if i == ni else ''}: margins top/bottom/left/right "
+                   f"{_margins_cm(sc)} cm | raw {[round(x.cm, 2) for x in (sc.top_margin, sc.bottom_margin, sc.left_margin, sc.right_margin)]}"
+                   f" | header/footer distance {round(sc.header_distance.cm, 2)}/{round(sc.footer_distance.cm, 2)}"
+                   f" | {round(sc.page_width.cm, 1)} x {round(sc.page_height.cm, 1)} cm")
+    sec = doc.sections[ni]
+    for name, part in (("header", sec.header), ("first-page header", sec.first_page_header),
+                       ("footer", sec.footer), ("first-page footer", sec.first_page_footer)):
+        el = part._element
+        lines = [_own_text(p) for p in el.iter(qn("w:p")) if _own_text(p)]
+        out.append(f"{name}: {len(lines)} text line(s) | tables {len(list(el.iter(qn('w:tbl'))))} | "
+                   f"content controls {len(list(el.iter(qn('w:sdt'))))} | text boxes {len(list(el.iter(qn('w:txbxContent'))))}"
+                   f" | PAGE field {_has_page_field(part)}")
+        for ln in lines[:6]:
+            out.append(f"    '{ln[:70]}'")
+    body = doc.element.body
+    n_sdt = len(list(body.iter(qn("w:sdt"))))
+    out.append(f"body: content controls {n_sdt} | text boxes {len(list(body.iter(qn('w:txbxContent'))))}")
+    tbls = _all_tables(doc)
+    out.append(f"tables found (all, incl. inside content controls): {len(tbls)}  (document.tables sees {len(doc.tables)})")
+    for i, t in enumerate(tbls[:12], 1):
+        try:
+            hdr = " | ".join(_own_text(c._tc.find(qn("w:p"))) [:22] if c._tc.find(qn("w:p")) is not None else "" for c in t.rows[0].cells)
+        except IndexError:
+            hdr = "(no rows)"
+        inside = any(a.tag == qn("w:sdt") for a in t._tbl.iterancestors())
+        out.append(f"  table {i}: rows {len(t.rows)} | grid {_grid_cm(t)} | cell widths {_cell_widths_cm(t)} | "
+                   f"in content control {inside} | header row: {hdr}")
+    return "\n".join(out)
+
+
+
 def save_client_profile(diff, client, clients_dir):
     """Writes/updates clients/<client>.json: only the "output" keys found in the Word file are replaced;
     every other key already in the file (alteryx, matching, name_format ...) is kept."""
@@ -505,6 +578,9 @@ def import_profile(docx_path, client=None, clients_dir=None, log=print):
 
 
 if __name__ == "__main__":
+    if "--inspect" in sys.argv:
+        print(describe_structure([a for a in sys.argv[1:] if not a.startswith("--")][0]))
+        sys.exit(0)
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     cdir = None
     if "--clients-dir" in sys.argv:
