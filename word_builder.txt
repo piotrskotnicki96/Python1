@@ -58,6 +58,7 @@ _OLD_INTRO = INTRO_ANNUAL.replace("financial period", "financial year")
 _OLD_INTRO_INTERIM = INTRO_ANNUAL.replace("annual report", "interim report")
 
 OUTPUT_DEFAULTS = {
+    "page_size": "A4",                           # "A4" / "Letter" / [width_cm, height_cm]
     "umbrella": "NOMURA FUNDS IRELAND PLC",
     "statement_title": "STATEMENT OF CHANGES IN THE PORTFOLIO",
     "continued_suffix": " (CONTINUED)",          # every page except the very first one
@@ -409,7 +410,9 @@ def _fill_footer(ftr, cfg):
 def _setup_section(sec, cfg, lines_first, lines_cont, is_first_fund):
     """Page size/margins + header (fund lines) + footer (page number) for one fund section."""
     sec.orientation = WD_ORIENT.PORTRAIT
-    sec.page_width, sec.page_height = Cm(21.0), Cm(29.7)
+    ps = cfg.get("page_size", "A4")
+    w_cm, h_cm = {"A4": (21.0, 29.7), "LETTER": (21.59, 27.94)}.get(str(ps).upper(), ps if isinstance(ps, (list, tuple)) else (21.0, 29.7))
+    sec.page_width, sec.page_height = Cm(w_cm), Cm(h_cm)
     top, bottom, left, right = cfg["margins_cm"]
     sec.top_margin, sec.bottom_margin, sec.left_margin, sec.right_margin = Cm(top), Cm(bottom), Cm(left), Cm(right)
     sec.header_distance, sec.footer_distance = Cm(cfg["header_distance_cm"]), Cm(cfg["footer_distance_cm"])

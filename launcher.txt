@@ -158,7 +158,8 @@ class Launcher(tk.Tk):
         self.b5 = ttk.Button(btns, text="Save fund map", command=self._on_save_fund_map)
         self.b3 = ttk.Button(btns, text="3. Generate Word / PDF", command=self._on_word)
         self.b6 = ttk.Button(btns, text="Layout from Word → profile", command=self._on_import_word)
-        for b in (self.b1, self.b2, self.b4, self.b5, self.b3, self.b6):
+        self.b7 = ttk.Button(btns, text="Layout from PDF → profile", command=self._on_import_pdf)
+        for b in (self.b1, self.b2, self.b4, self.b5, self.b3, self.b6, self.b7):
             b.pack(side="left", expand=True, fill="x", padx=3)
         ttk.Label(btns, text="Sales on new page:").pack(side="left", padx=(10, 2))
         self.sales_layout = tk.StringVar(value="(profile)")
@@ -318,6 +319,30 @@ class Launcher(tk.Tk):
             self._log("Layout import cancelled (no valid client name).")
             return
         self._run(lambda snap: self.step_import_word(p, name))
+
+    def _on_import_pdf(self):
+        p = filedialog.askopenfilename(title="PDF of the ORIGINAL published note (the real printed layout)",
+                                       filetypes=[("PDF", "*.pdf")])
+        if not p:
+            return
+        cur = self.client_var.get()
+        name = simpledialog.askstring("Client profile",
+                                      "Save the layout to clients/<name>.json\n(an existing file keeps its other settings).\n\nClient name:",
+                                      initialvalue="" if cur == DEFAULT_CLIENT else cur, parent=self)
+        name = "".join(ch for ch in (name or "") if ch.isalnum() or ch in " _-").strip()
+        if not name or name == "_template":
+            self._log("Layout import cancelled (no valid client name).")
+            return
+        self._run(lambda snap: self.step_import_pdf(p, name))
+
+    def step_import_pdf(self, pdf_path, client):
+        diff, rows = profile_import.extract_output_from_pdf(pdf_path)
+        self._log(f"Layout measured on {Path(pdf_path).name}:")
+        self._log(profile_import.format_report(rows))
+        if not diff:
+            self._log("Nothing to save (no differences from the defaults, or the PDF does not look like the note).")
+            return
+        self.after(0, lambda: self._confirm_save_profile(diff, client))
 
     def step_import_word(self, docx_path, client):
         diff, rows = profile_import.extract_output_settings(docx_path)

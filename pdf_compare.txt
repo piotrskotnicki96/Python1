@@ -13,6 +13,8 @@ from pathlib import Path
 import pdfplumber
 
 CM = 28.3465
+TEXT_TOP_OFFSET = 0.12        # text top of the first table row below the body start (cm, calibrated)
+TEXT_BOTTOM_SLACK = 0.10
 
 
 def _size_name(w, h):
@@ -39,8 +41,23 @@ def measure(pdf_path, max_pages=60):
             for w in body:
                 lines.setdefault(round(w["top"]), []).append(w)
             ks = sorted(lines)
+            pn_gap = None
             if len(ks) > 3 and len(lines[ks[-1]]) == 1 and lines[ks[-1]][0]["text"].isdigit():
+                pn_gap = (pg.height - lines[ks[-1]][0]["bottom"]) / CM
                 ks = ks[:-1]            # page number
+            # header block above the table: first word, line pitch
+            hdr = {}
+            for w in words:
+                if w["top"] < h0 - 1:
+                    hdr.setdefault(round(w["top"]), w)
+            ht = sorted(hdr)
+            hp = [b - a for a, b in zip(ht, ht[1:]) if 4 < b - a < 16]
+            # right edges of the numeric columns (second-to-last / last number of a row)
+            nom_x, amt_x = [], []
+            for k in ks[1:]:
+                nums = sorted((w for w in lines[k] if w["text"].replace(",", "").isdigit()), key=lambda w: w["x0"])
+                if len(nums) >= 2:
+                    nom_x.append(nums[-2]["x1"]); amt_x.append(nums[-1]["x1"])
             if len(ks) < 2:
                 continue
             tops = [min(w["top"] for w in lines[k]) for k in ks]
@@ -50,7 +67,12 @@ def measure(pdf_path, max_pages=60):
                           "bottom_gap": (pg.height - max(w["bottom"] for w in ws)) / CM,
                           "lines": len(ks), "pitch": pitch, "left": min(w["x0"] for w in ws) / CM,
                           "right": (pg.width - max(w["x1"] for w in ws)) / CM,
-                          "size": statistics.median(w["size"] for w in ws)})
+                          "size": statistics.median(w["size"] for w in ws),
+                          "first_word_top": (min(w["top"] for w in words) / CM),
+                          "header_pitch": statistics.median(hp) if hp else None,
+                          "nom_x": statistics.median(nom_x) / CM if nom_x else None,
+                          "amt_x": statistics.median(amt_x) / CM if amt_x else None,
+                          "pn_gap": pn_gap})
     return n_total, pages
 
 

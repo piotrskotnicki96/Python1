@@ -569,6 +569,79 @@ def extract_output_settings(docx_path, measure=True):
     return diff, rows
 
 
+def extract_output_from_pdf(pdf_path):
+    """Layout from a PDF of the ORIGINAL published note (the real, printed layout - a Word/Confluence source can differ
+    from it). Measures page size, margins, line pitch, font size, header/footer position and column widths.
+    Returns (output_diff, rows) like extract_output_settings."""
+    import statistics
+    import pdf_compare as pc
+    _n, pages = pc.measure(pdf_path)
+    default = word_builder.OUTPUT_DEFAULTS
+    found, comments, rejected = {}, {}, {}
+
+    def put(key, value, comment=""):
+        ok, why = _plausible(key, value)
+        if not ok:
+            rejected[key] = (value, why)
+            return
+        found[key] = value
+        if comment:
+            comments[key] = comment
+
+    if not pages:
+        rows = [("_pdf", None, None, "NOT FOUND", "no Purchases/Sales table found in the PDF")]
+        return {}, rows
+    w_cm, h_cm = pages[0]["w"] / pc.CM, pages[0]["h"] / pc.CM
+    name = pc._size_name(pages[0]["w"], pages[0]["h"])
+    put("page_size", name if name in ("A4", "Letter") else [round(w_cm, 2), round(h_cm, 2)])
+    cont = [p for p in pages if p["head_top"] < 6] or pages
+    top = round(statistics.median(p["head_top"] for p in cont) - pc.TEXT_TOP_OFFSET, 2)
+    left = round(min(p["left"] for p in pages), 2)
+    right = round(min(p["right"] for p in pages), 2)
+    full = [p for p in pages if p["lines"] >= 45]
+    bottom_cm = round(min(p["bottom_gap"] for p in full) - pc.TEXT_BOTTOM_SLACK, 2) if full else None
+    margins = [top, bottom_cm if bottom_cm is not None else default["margins_cm"][1], left, right]
+    put("margins_cm", margins, "" if bottom_cm is not None else
+        "bottom margin kept at the default - no (almost) full page in the PDF to measure it on")
+    fp = max(pages, key=lambda p: p["lines"])
+    if fp["pitch"]:
+        put("line_pt", round(fp["pitch"], 2))
+    put("font_size", round(statistics.median(p["size"] for p in pages) * 2) / 2,
+        "rounded to 0.5 pt (Word); measured %.1f pt" % statistics.median(p["size"] for p in pages))
+    put("header_distance_cm", round(statistics.median(p["first_word_top"] for p in cont) - 0.05, 3))
+    hp = [p["header_pitch"] for p in cont if p["header_pitch"]]
+    if hp:
+        put("header_line_pt", round(statistics.median(hp), 2))
+    pn = [p["pn_gap"] for p in pages if p["pn_gap"] is not None]
+    put("page_numbers", bool(pn))
+    if pn:
+        put("footer_distance_cm", round(statistics.median(pn), 2))
+    nx = [p["nom_x"] for p in pages if p["nom_x"]]
+    ax = [p["amt_x"] for p in pages if p["amt_x"]]
+    if nx and ax:
+        table_w = round(w_cm - left - right, 2)
+        nom_right = statistics.median(nx) - left
+        nom_w = default["col_widths_cm"][1]            # the nominal column width itself is not visible in a PDF
+        put("col_widths_cm", [round(nom_right - nom_w, 2), nom_w, round(table_w - nom_right, 2)],
+            "name/amount split measured from the numbers; nominal column width kept at the default")
+    comments["char_scale"] = "horizontal text scale is not visible in a PDF - kept at the default; compare with pdf_compare.py"
+    rows = []
+    for key in sorted(set(found) | set(rejected) | set(comments)):
+        if key in rejected:
+            val, why = rejected[key]
+            rows.append((key, val, default.get(key), "IGNORED (implausible)", why))
+        elif key in found:
+            val = found[key]
+            st = "DIFFERENT" if _differs(val, default.get(key)) else "same as default"
+            rows.append((key, val, default.get(key), st, comments.get(key, "")))
+        else:
+            rows.append((key, None, default.get(key), "note", comments[key]))
+    diff = {k: v for k, v in found.items() if _differs(v, default.get(k))}
+    if len(rejected) >= 3:
+        diff = {}
+    return diff, rows
+
+
 def format_report(rows):
     out = []
     for k, val, default, status, comment in rows:
