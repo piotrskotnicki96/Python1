@@ -1320,6 +1320,9 @@ def run_matching(alteryx_folder, soi_cy_df, soi_py_df, profile, out_path, mappin
     """external_paths: {"BLOOMBERG": file_or_folder, "PVAL": file_or_folder} (optional).
     fund_map_path: data/funds_<client>.xlsx (optional) - Fund Id -> SOI fund name (CY, and PY if renamed)."""
     cfg = merge_profile(profile)
+    _nf = cfg["name_format"]
+    log(f"Name style: {_nf.get('style', 'full')} | {len(_nf.get('replacements') or [])} name replacement(s) | "
+        f"footnote marks stripped: {_nf.get('strip_footnote_marks', True)}")
     ax_rows, ax_raw = read_alteryx_folder(alteryx_folder, cfg, log)
     ax = enrich_alteryx(ax_rows, cfg)
     log(f"Alteryx: {ax['fund_id'].nunique()} fund(s), {len(ax)} rows")

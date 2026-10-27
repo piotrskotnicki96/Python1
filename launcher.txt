@@ -214,6 +214,7 @@ class Launcher(tk.Tk):
         """Built-in settings + (optionally) the client's JSON on top - the JSON may contain only what differs."""
         prof = json.loads(json.dumps(TEMPLATE_PROFILE))
         path = self.clients.get(snap["client"])
+        self._log(f"Client profile: {snap['client']} -> {path if path else 'built-in settings (no JSON)'}")
         if path:
             deep_merge(prof, json.loads(path.read_text(encoding="utf-8")))
         if snap.get("sales_layout") in ("always", "auto", "fit"):      # dropdown overrides the profile
