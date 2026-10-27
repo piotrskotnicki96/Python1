@@ -1,0 +1,78 @@
+{
+  "client_name": "Lord Abbett",
+  "name_format": {
+    "style": "issuer_only",
+    "replacements": [
+      [
+        "^United States Treasury (Note/Bond|Note|Bond)$",
+        "U.S. Treasury Note"
+      ],
+      [
+        "^United States Treasury Bill$",
+        "U.S. Treasury Bill"
+      ],
+      [
+        "^Fannie Mae or Freddie Mac$",
+        "Federal National Mortgage Assoc."
+      ],
+      [
+        "^Autonation Inc( Disc( \\d+)?)?$",
+        "AutoNation, Inc."
+      ],
+      [
+        "^Targa Res Corp Disc$",
+        "Targa Resources Partners LP/Targa Resources Partners Finance Corp."
+      ],
+      [
+        "^T/L Gen Digital Inc\\.$",
+        "Gen Digital, Inc. Initial Tranche A Term Loan"
+      ],
+      [
+        "^T/L American Airlines Inc Term Loan$",
+        "American Airlines, Inc. Term Loan"
+      ],
+      [
+        "^T/L Atlas Warehouse Lending Company L\\.p\\.$",
+        "Atlas Warehouse Lending Co. LP Term Loan"
+      ],
+      [
+        "\\bLtd$",
+        "Ltd."
+      ]
+    ]
+  },
+  "output": {
+    "page_size": "Letter",
+    "umbrella": "LORD ABBETT GLOBAL FUNDS I PLC",
+    "statement_title": "SCHEDULE OF PORTFOLIO CHANGES",
+    "continued_suffix": "",
+    "header_lines": [
+      "{umbrella}",
+      "{statement_title}"
+    ],
+    "header_lines_rule": false,
+    "fund_heading_in_body": true,
+    "intro_text": "The following Statements of Changes in Composition of Portfolio reflect the aggregate purchases of a security exceeding one percent of the total value of purchases and aggregate disposals greater than one percent of the total sales for the period. At a minimum, the largest twenty purchases and twenty sales are presented.",
+    "purchases_title": "Purchases",
+    "sales_title": "Sales",
+    "total_label_below": 0,
+    "columns_layout": "rate_maturity",
+    "col_nominal": "Nominal\nAmount",
+    "col_purchases_amount": "Cost\n{ccy}",
+    "col_sales_amount": "Proceeds\n{ccy}",
+    "footer_distance_cm": 0.508,
+    "header_font_size": 10.0,
+    "header_line_pt": 11.0,
+    "page_numbers": false,
+    "font_size": 9.5,
+    "char_scale": 100,
+    "sales_new_page": "fit",
+    "table_gap_pt": 12,
+    "margins_cm": [
+      4.5,
+      1.32,
+      2.13,
+      2.13
+    ]
+  }
+}
