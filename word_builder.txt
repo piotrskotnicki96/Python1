@@ -58,7 +58,9 @@ _OLD_INTRO = INTRO_ANNUAL.replace("financial period", "financial year")
 _OLD_INTRO_INTERIM = INTRO_ANNUAL.replace("annual report", "interim report")
 
 OUTPUT_DEFAULTS = {
+    "strip_footnote_marks": True,                # remove trailing * † ‡ § ¶ from names
     "page_size": "A4",                           # "A4" / "Letter" / [width_cm, height_cm]
+    "fund_heading_in_body": False,               # True: the fund name is printed in bold above the tables (e.g. EAM) instead of in the page header
     "umbrella": "NOMURA FUNDS IRELAND PLC",
     "statement_title": "STATEMENT OF CHANGES IN THE PORTFOLIO",
     "continued_suffix": " (CONTINUED)",          # every page except the very first one
@@ -75,6 +77,10 @@ OUTPUT_DEFAULTS = {
     "purchases_title_all": "Total Purchases",    # used when the side has fewer rows than total_label_below
     "sales_title_all": "Total Sales",
     "total_label_below": 20,                     # 0 = always "Major ..."
+    "columns_layout": "name_amount",             # "name_amount" = Name | Nominal | Amount; "rate_maturity" = Name | Interest Rate | Maturity Date | Nominal | Amount
+    "col_widths_cm_5": [7.2, 2.0, 2.4, 2.6, 2.64],   # used by "rate_maturity"
+    "col_rate": "Interest\nRate",
+    "col_maturity": "Maturity\nDate",
     "col_nominal": "Nominal",
     "col_purchases_amount": "Cost {ccy}",
     "col_sales_amount": "Proceeds {ccy}",
@@ -96,6 +102,7 @@ OUTPUT_DEFAULTS = {
                                             # "auto" = new page only when Purchases + Sales would fill more than auto_fill_ratio of one page (too crowded);
                                             # "fit" = after Purchases whenever it fits
     "auto_fill_ratio": 0.8,                 # "auto": max share of a page Purchases + Sales may fill together
+    "table_gap_pt": 1,                       # empty space between the Purchases and Sales tables (when Sales follows on the same page)
     "rows_per_page": 55,                     # estimate used only to decide "Sales on a new page"
     "make_pdf": True,
 }
@@ -287,7 +294,7 @@ def _cell_text(cell, text, cfg, bold=False, align=None, keep_next=False):
     p.paragraph_format.keep_with_next = keep_next
     if align:
         p.alignment = align
-    r = p.add_run(text)
+    r = p.add_run(text)             # python-docx turns "\n" in the text into a line break (e.g. "Cost\nUSD")
     r.bold = bold
     r.font.name = cfg["font"]
     r.font.size = Pt(cfg["font_size"])
@@ -300,17 +307,40 @@ def _lines_for(name, cfg):
     return max(1, math.ceil(len(str(name)) / chars))
 
 
+def fmt_rate(c):
+    """3.75 -> '3.75%', 4.125 -> '4.125%', 6 -> '6.00%' (2 to 3 decimals, as in the published LA note); None -> ''."""
+    v = to_num(c)
+    if v is None:
+        return ""
+    t = f"{Decimal(str(v)).quantize(Decimal('0.001'), rounding=ROUND_HALF_UP):f}"
+    if t.endswith("0"):
+        t = t[:-1]
+    return t + "%"
+
+
+def fmt_maturity(m):
+    if _isna(m) or str(m).strip() == "":
+        return ""
+    if hasattr(m, "strftime"):
+        return m.strftime("%d/%m/%Y")
+    return str(m).strip()
+
+
 def _add_side(doc, rows, title, amount_header, cfg, keep_together=False, page_break=False):
     """One table; the title sits in the first cell of the (repeated) header row, like in the Nomura report.
     keep_together=True: every row keeps with the next one, so Word moves the whole table to the next page
     when it does not fit under the previous one."""
-    t = doc.add_table(rows=1, cols=3)
+    five = cfg.get("columns_layout") == "rate_maturity"
+    ncol = 5 if five else 3
+    R = WD_ALIGN_PARAGRAPH.RIGHT
+    t = doc.add_table(rows=1, cols=ncol)
     t.alignment = WD_TABLE_ALIGNMENT.LEFT
     t.autofit = False
     hdr = t.rows[0]
     _row_flags(hdr, header=True)
-    for i, (txt, al) in enumerate(((title, None), (cfg["col_nominal"], WD_ALIGN_PARAGRAPH.RIGHT),
-                                   (amount_header, WD_ALIGN_PARAGRAPH.RIGHT))):
+    heads = ((title, None), (cfg["col_rate"], R), (cfg["col_maturity"], R), (cfg["col_nominal"], R),
+             (amount_header, R)) if five else ((title, None), (cfg["col_nominal"], R), (amount_header, R))
+    for i, (txt, al) in enumerate(heads):
         _cell_text(hdr.cells[i], txt, cfg, bold=True, align=al, keep_next=True)
         if page_break and i == 0:
             hdr.cells[0].paragraphs[0].paragraph_format.page_break_before = True
@@ -322,11 +352,12 @@ def _add_side(doc, rows, title, amount_header, cfg, keep_together=False, page_br
         _row_flags(row)
         kn = keep_together and not last
         _cell_text(row.cells[0], r["name"], cfg, keep_next=kn)
-        _cell_text(row.cells[1], fmt_int(r["nominal"]), cfg, align=WD_ALIGN_PARAGRAPH.RIGHT, keep_next=kn)
-        _cell_text(row.cells[2], fmt_int(r["amount"]), cfg, align=WD_ALIGN_PARAGRAPH.RIGHT, keep_next=kn)
-        # a name wrapped over 2 lines: the numbers sit on the LAST line (as in the real report)
-        row.cells[1].vertical_alignment = WD_ALIGN_VERTICAL.BOTTOM
-        row.cells[2].vertical_alignment = WD_ALIGN_VERTICAL.BOTTOM
+        vals = ([fmt_rate(r.get("rate")), fmt_maturity(r.get("maturity"))] if five else []) + \
+               [fmt_int(r["nominal"]), fmt_int(r["amount"])]
+        for j, v in enumerate(vals, start=1):
+            _cell_text(row.cells[j], v, cfg, align=R, keep_next=kn)
+            # a name wrapped over 2 lines: the numbers sit on the LAST line (as in the real report)
+            row.cells[j].vertical_alignment = WD_ALIGN_VERTICAL.BOTTOM
     # fixed layout + grid widths: Word AND LibreOffice then keep the column widths
     tbl_pr = t._tbl.tblPr
     layout = OxmlElement("w:tblLayout")
@@ -342,7 +373,7 @@ def _add_side(doc, rows, title, amount_header, cfg, keep_together=False, page_br
             look.addprevious(el)
         else:
             tbl_pr.append(el)
-    for i, w in enumerate(cfg["col_widths_cm"]):
+    for i, w in enumerate(cfg["col_widths_cm_5"] if five else cfg["col_widths_cm"]):
         t.columns[i].width = Cm(w)
         for cell in t.columns[i].cells:
             cell.width = Cm(w)
@@ -510,6 +541,8 @@ def build_note(review_path, out_docx, profile=None, period="", fund_map_path=Non
         intro = cfg.get("intro_text") or cfg["intro_text_" + ("interim" if rtype == "interim" else "annual")]
         if k == 0 and intro:
             _para(doc, intro.format(**repl), cfg, align=WD_ALIGN_PARAGRAPH.JUSTIFY, space_after=12)
+        if cfg.get("fund_heading_in_body"):
+            _para(doc, fund_name, cfg, bold=True, space_after=12, keep_next=True)
         purchases_lines = 0
         intro_lines = (math.ceil(len(intro.format(**repl)) / 95) + 1) if (k == 0 and intro) else 0
         for side, title_key, col_key in (("Purchases", "purchases_title", "col_purchases_amount"),
@@ -517,7 +550,10 @@ def build_note(review_path, out_docx, profile=None, period="", fund_map_path=Non
             s = g[g["Side"] == side].copy()
             s["_no"] = pd.to_numeric(s["No"], errors="coerce")
             s = s.sort_values("_no")
-            rows = [{"name": r["Final Name"], "nominal": to_num(r["Nominal"]), "amount": to_num(r["Amount"])}
+            _fm = re.compile(r"\s*[*\u2020\u2021\u00a7\u00b6]+\s*$")     # footnote markers at the end of a name
+            _strip = (lambda x: _fm.sub("", str(x))) if cfg.get("strip_footnote_marks", True) else (lambda x: x)
+            rows = [{"name": _strip(r["Final Name"]), "nominal": to_num(r["Nominal"]), "amount": to_num(r["Amount"]),
+                     "rate": r.get("Coupon"), "maturity": r.get("Maturity")}
                     for _, r in s.iterrows()]
             if not rows:
                 continue
@@ -526,7 +562,7 @@ def build_note(review_path, out_docx, profile=None, period="", fund_map_path=Non
             if side == "Purchases":
                 purchases_lines = lines
                 _add_side(doc, rows, title, cfg[col_key].format(**repl), cfg)
-                _para(doc, "", cfg, size=1, line=1)
+                _para(doc, "", cfg, size=1, line=float(cfg.get("table_gap_pt", 1)))
             else:
                 # longer than a page -> always a new page; otherwise Word keeps it together and moves it
                 # to the next page only when it does not fit under Purchases

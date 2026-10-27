@@ -69,6 +69,11 @@ DEFAULTS = {
         # Bloomberg 144A_FLAG = Y -> " 144A" appended to the issuer (SOI convention, e.g. "Bandhan Bank Ltd 144A").
         # Equity: after the name ("BlackBuck Ltd 144A"); Debt: after the date ("Issuer, 5.300%, 08/01/29 144A")
         "append_144a_for": ["Equity", "Debt"],
+        # "full" = 'Issuer, 5.125%, 05/11/35' (Nomura). "issuer_only" = just the issuer (e.g. Lord Abbett: rate and maturity
+        # are separate columns in the note): coupon/ZCP/date/144A and 'YYYY-NNA Class X' are removed from debt names.
+        "style": "full",
+        # [[regex, replacement], ...] applied in order to every final name (client spellings), case-insensitive
+        "replacements": [],
         "keep_upper": ["PT", "LG", "KB", "BDO", "KT&G", "CDBL", "MISC", "BVI", "HK", "US", "USA", "PLC",
                        "LLC", "SA", "AG", "NV", "AB", "ASA", "SPA", "L&T", "ICICI", "HDFC", "DLF", "AU", "JSW"],
     },
@@ -119,6 +124,39 @@ def merge_profile(profile):
 
 
 # ============================ NORMALISATION ============================
+FOOTNOTE_MARK_RE = re.compile(r"\s*[*\u2020\u2021\u00a7\u00b6]+\s*$")
+
+
+def strip_footnote_marks(name, cfg=None):
+    """Removes trailing footnote markers (* † ‡ § ¶) from a name: 'AutoZone, Inc.*' -> 'AutoZone, Inc.'.
+    Switch off with name_format.strip_footnote_marks = false in the client profile."""
+    if name is None or (cfg is not None and cfg.get("name_format", {}).get("strip_footnote_marks", True) is False):
+        return name
+    return FOOTNOTE_MARK_RE.sub("", str(name))
+
+
+_RATE_DATE_TAIL_RE = re.compile(r",?\s*(?:ZCP|\d+(?:\.\d+)?%)\s*,?\s*(?:\d{1,2}/\d{1,2}/\d{2,4}|Perpetual)\b.*$", re.I)
+_SERIES_CLASS_RE = re.compile(r"\s+\d{4}-\w+\s+Class\s*\w+.*$", re.I)
+_144A_TAIL_RE = re.compile(r"[\s,]+144A\s*$", re.I)
+
+
+def apply_name_style(name, kind, cfg):
+    """Client name style on top of the matched name. 'issuer_only' (debt): drops 144A, coupon/ZCP + maturity and
+    'YYYY-NNA Class X' (CLO series); then the client's regex replacements ([[pattern, replacement], ...])."""
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return name
+    nf = cfg.get("name_format", {})
+    out = str(name)
+    if nf.get("style") == "issuer_only" and kind == "Debt" and "[COUPON?]" not in out and "[DATE?]" not in out:
+        out = _144A_TAIL_RE.sub("", out)
+        out = _RATE_DATE_TAIL_RE.sub("", out)
+        out = _SERIES_CLASS_RE.sub("", out)
+        out = out.strip(" ,")
+    for pat, rep in nf.get("replacements", []) or []:
+        out = re.sub(pat, rep, out, flags=re.I)
+    return out
+
+
 def norm(text, drop=()):
     s = str(text or "").upper()
     s = re.sub(r"[^\w&]", " ", s)
@@ -1342,10 +1380,10 @@ def run_matching(alteryx_folder, soi_cy_df, soi_py_df, profile, out_path, mappin
             "Coupon": row["_coupon"] if row["_kind"] == "Debt" else None,
             "Maturity": mat.strftime("%d/%m/%Y") if mat is not None else None,
             "Nominal": to_float(row["nominal"]), "Amount": to_float(row["amount"]),
-            "Proposed Name": res["name"], "Source": res["src"], "Method": res["method"],
+            "Proposed Name": apply_name_style(strip_footnote_marks(res["name"], cfg), row["_kind"], cfg), "Source": res["src"], "Method": res["method"],
             "Issuer Score": res["score"], "SOI Holding": res["soi_hold"], "Comments": res["note"],
             **xcols,
-            "Status": res["status"], "Final Name": res["name"],
+            "Status": res["status"], "Final Name": apply_name_style(strip_footnote_marks(res["name"], cfg), row["_kind"], cfg),
         })
     rv = pd.DataFrame(out_rows)
     if rv.empty:
