@@ -48,12 +48,13 @@ MAX_WRAP_LINES = 3
 # Coupon: 5.125% / 5.1% / 5% / ZCP. Date: dd/mm/yy, d/m/yy, dd/mm/yyyy or "Perpetual".
 # A 4-digit year only when no digit/comma follows: long names can glue the date to the holding
 # ("15/05/30500,000" = 15/05/30 + 500,000).
+# Also read: no commas ("Name 3.574% 15/02/2050 11,040 ...") and footnote markers glued to the coupon ("3.526%(1)").
 SEC_RE = re.compile(
-    r"^(?P<name>.+?),?\s+(?P<cpn>\d{1,2}(?:\.\d{1,4})?%|ZCP),\s*"
+    r"^(?P<name>.+?),?\s+(?P<cpn>\d{1,2}(?:\.\d{1,4})?%|ZCP)(?P<cfn>(?:\s*\(\s*\w{1,3}\s*\))*),?\s*"
     r"(?P<date>\d{1,2}/\d{1,2}/(?:\d{4}(?![\d,])|\d{2})|Perpetual\b)(?P<rest>.*)$", re.I
 )
 # Country/sector header: "Financial - 3.74% (31st December, 2024: 7.22%)"
-HEADER_RE = re.compile(r"^(?P<label>.+?)\s+-\s+[\d.,–-]*%?\s*\(\d{1,2}(st|nd|rd|th)\s", re.I)
+HEADER_RE = re.compile(r"^(?P<label>.+?)\s+-\s+[\d.,–-]*%?\s*\(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]", re.I)
 DATE_ANYWHERE_RE = re.compile(r"\d{1,2}/\d{1,2}/\d{2,4}")
 NUM_RE = re.compile(r"^\(?-?[\d,]+(\.\d+)?\)?%?$")
 # Equity: "State Bank of India 4,053,980 38,337,394 3.52%" (name + holding + fair value + %)
@@ -151,7 +152,22 @@ def has_title(lines, titles):
 def looks_like_name_part(text):
     """First line of a security name wrapped over two lines: words, no numbers or %, not an ALL-CAPS label."""
     t = text.strip()
-    return bool(t) and not re.search(r"[\d%]", t) and not t.isupper() and not t.endswith(":")
+    return bool(t) and not re.search(r"%|\d,\d{3}|\d/\d", t) and not t.isupper() and not t.endswith(":") \
+        and not all(NUM_RE.match(x) for x in t.split())
+
+
+def italic_line_texts(page):
+    """Texts of the lines printed entirely in italics (sub-sector headings such as 'Commercial Mortgage-Backed',
+    'Credit Card'). Used so that such a heading is not glued to the first security below it."""
+    out = set()
+    try:
+        for ln in page.extract_text_lines():
+            letters = [c for c in ln["chars"] if c["text"].strip() and c["text"].isalpha()]
+            if letters and all(re.search(r"italic|oblique", c.get("fontname", ""), re.I) for c in letters):
+                out.add(ln["text"].strip())
+    except Exception:  # noqa: BLE001 - optional helper
+        pass
+    return out
 
 
 def find_fund(lines, titles):
@@ -188,10 +204,15 @@ def parse_pdf(pdf_path, soi_titles=None, ignore_contains=None):
 
     with pdfplumber.open(pdf_path) as pdf:
         fund = section = sector = None
+        sector_from_header = False
         in_soi = False
         for pno, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
             lines = [ln.strip() for ln in text.splitlines()]
+            italics = italic_line_texts(page)
+            # "Principal (000)" in the table header: debt holdings are printed in thousands
+            head_txt = " ".join(lines[:16])
+            debt_mult = 1000 if re.search(r"\(\s*000s?\s*\)", head_txt) else 1
             if has_title(lines, titles):
                 in_soi, cont = True, False
                 new_fund = find_fund(lines, titles) or fund
@@ -217,6 +238,14 @@ def parse_pdf(pdf_path, soi_titles=None, ignore_contains=None):
             for ln in lines:
                 if not ln:
                     continue
+                if ln in italics and not SEC_RE.match(ln) and not EQ_RE.match(ln) and not SUBTOTAL_RE.match(ln):
+                    # sub-sector heading (italic): the header printed before it becomes the section
+                    if sector and sector_from_header and not section:
+                        section = sector
+                    sector, sector_from_header = ln, False
+                    buffer = []
+                    reset_acc()
+                    continue
                 h = HEADER_RE.match(ln)
                 if h:
                     label = h.group("label").strip()
@@ -227,7 +256,7 @@ def parse_pdf(pdf_path, soi_titles=None, ignore_contains=None):
                     if label.isupper():
                         section, sector = label, None
                     else:
-                        sector = label
+                        sector, sector_from_header = label, True
                     buffer = []
                     if not cont_hdr:
                         reset_acc()
@@ -267,19 +296,30 @@ def parse_pdf(pdf_path, soi_titles=None, ignore_contains=None):
                             m, used = mj, joined
                 if m:
                     footnotes, holding, fv, pct, desig = split_rest(m.group("rest"))
+                    if holding is not None and debt_mult != 1:
+                        holding = holding * debt_mult           # "Principal (000)" -> units
                     cpn_txt = m.group("cpn")
+                    # footnote markers: glued to the coupon "3.526%(1)" or to the end of the name "Class A(2)"
+                    cfn = [x.strip() for x in re.findall(r"\(\s*\w{1,3}\s*\)", m.group("cfn") or "")]
+                    name_txt = m.group("name").strip().rstrip(",")
+                    while TRAIL_FOOTNOTE_RE.search(name_txt):
+                        fn = TRAIL_FOOTNOTE_RE.search(name_txt)
+                        cfn.insert(0, fn.group(0).strip())
+                        name_txt = name_txt[:fn.start()].strip()
+                    footnotes = cfn + footnotes
+                    pub = (name_txt + used[m.end("name"):m.start("cfn")] + used[m.end("cfn"):m.end("date")]).strip()
                     rows.append({
                         "Fund": fund,
                         "Page": pno,
                         "Type": "Debt",
                         "Section": section,
                         "Sector": sector,
-                        "Issuer": m.group("name").strip().rstrip(","),
+                        "Issuer": name_txt,
                         "Coupon": None if cpn_txt.upper() == "ZCP" else float(cpn_txt.rstrip("%")),
                         "ZCP": cpn_txt.upper() == "ZCP",
                         "Maturity": parse_date(m.group("date")),
                         # '..., 08/01/29 144A' - 144A after the date is part of the published name
-                        "Name_publication": " ".join([used[: m.end("date")].strip()] + desig),
+                        "Name_publication": " ".join([pub] + desig),
                         "Footnotes": " ".join(footnotes),
                         "Holding": holding,
                         "Fair_Value": fv,
