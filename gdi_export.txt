@@ -1,0 +1,262 @@
+"""
+GDI export - fills an EMPTY GDI template with the data of the (reviewed) Review file.
+
+The template (clients/<client>/GDI_template.xlsx) is loaded, its header rows and all column settings (hidden
+columns, widths, colours) stay as they are; the data rows are cleared and rewritten. Only the columns listed in
+the profile ("gdi" -> "columns") are filled, all other columns stay empty.
+
+Profile section (every key optional; the defaults below follow the Vanguard GDI specification):
+    "gdi": {
+        "template": "GDI_template.xlsx",        # file name inside clients/<client>/  (or a full path)
+        "data_start_row": 5,                    # first data row of the template (rows above are headers)
+        "columns": {                            # Excel column -> source
+            "A": "end_date",                    #   period typed in the launcher (real Excel date)
+            "B": "fund_id",
+            "C": "const:PORTFOLIO_CHANGES_{seq}",   # {seq} = running number
+            "D": "const:PORTFOLIO_CHANGES",
+            "E": "side_code",                   #   P (purchases) / S (sales)
+            "K": "maturity",                    #   real Excel date, empty for equities
+            "L": "name",                        #   Final Name from the Review file
+            "M": "rate",                        #   coupon text, see rate_format
+            "AQ": "position",                   #   Review "Nominal"  (Alteryx Position)
+            "BF": "principal_base",             #   Review "Amount"   (Alteryx Principal Base)
+            "BW": "const:N"
+        },
+        "rate_format": "{:.2f}%",               # 3.75 -> 3.75% ; ZCP -> 0.00%
+        "seq_scope": "fund",                    # "fund" = numbering restarts per fund, "file" = one sequence
+        "file_per_fund": false                  # true = one GDI file per fund
+    }
+Sources: end_date, fund_id, side_code, side, seq, maturity, name, rate, coupon, position, principal_base, nominal,
+amount, soi_fund, asset_id, const:<text>   ({seq}, {fund_id}, {side_code} can be used inside const:).
+"""
+
+import copy
+import re
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+import pandas as pd
+
+BLOCKING_MARKERS = ["[COUPON?]", "[DATE?]", "[FUND NAME?"]
+
+DEFAULT_GDI = {
+    "template": "GDI_template.xlsx",
+    "data_start_row": 5,
+    "columns": {
+        "A": "end_date", "B": "fund_id", "C": "const:PORTFOLIO_CHANGES_{seq}", "D": "const:PORTFOLIO_CHANGES",
+        "E": "side_code", "K": "maturity", "L": "name", "M": "rate", "AQ": "position", "BF": "principal_base",
+        "BW": "const:N",
+    },
+    "rate_format": "{:.2f}%",
+    "seq_scope": "fund",
+    "file_per_fund": False,
+}
+
+
+def _isna(v):
+    return v is None or (isinstance(v, float) and v != v) or (isinstance(v, str) and not v.strip()) \
+        or (hasattr(pd, "isna") and not isinstance(v, (list, tuple, str)) and bool(pd.isna(v)))
+
+
+def _num(v):
+    if _isna(v):
+        return None
+    try:
+        return float(str(v).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _fid(v):
+    if _isna(v):
+        return ""
+    s = str(v).strip()
+    return s[:-2] if re.fullmatch(r"\d+\.0", s) else s
+
+
+def parse_period(text):
+    """'30/06/2026' or '2026-06-30' -> datetime."""
+    t = str(text or "").strip().replace(".", "/").replace("-", "/")
+    for fmt in ("%d/%m/%Y", "%Y/%m/%d", "%d/%m/%y"):
+        try:
+            return datetime.strptime(t, fmt)
+        except ValueError:
+            pass
+    raise ValueError(f"Period '{text}' is not a date (dd/mm/yyyy) - it goes into the snapshot date column.")
+
+
+def _to_datetime(v):
+    if _isna(v):
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day)
+    if hasattr(v, "to_pydatetime"):
+        return v.to_pydatetime()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(str(v).strip(), fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def _rate_text(coupon, fmt):
+    c = _num(coupon)
+    if c is None:
+        return None
+    return fmt.format(c)
+
+
+def _cfg(profile_gdi):
+    cfg = copy.deepcopy(DEFAULT_GDI)
+    for k, v in (profile_gdi or {}).items():
+        if k == "columns" and isinstance(v, dict):
+            cfg["columns"] = dict(v)         # a profile lists the full mapping it wants
+        else:
+            cfg[k] = v
+    return cfg
+
+
+def _rows_from_review(review_path):
+    rv = pd.read_excel(review_path, sheet_name="Review", dtype={"Fund Id": str})
+    need = ["Fund Id", "Side", "No", "Final Name", "Nominal", "Amount"]
+    miss = [c for c in need if c not in rv.columns]
+    if miss:
+        raise ValueError(f"{Path(review_path).name}: not a Review file (missing columns {miss})")
+    rv["Fund Id"] = rv["Fund Id"].apply(_fid)
+    rv["Final Name"] = rv["Final Name"].apply(lambda v: "" if _isna(v) else str(v).strip())
+    bad = rv[(rv["Final Name"] == "") | rv["Final Name"].apply(lambda s: any(m in s for m in BLOCKING_MARKERS))]
+    if not bad.empty:
+        lines = [f"  fund {r['Fund Id']} {r['Side']} row {r['No']}: '{r['Final Name']}'" for _, r in bad.head(20).iterrows()]
+        raise ValueError("Final Name missing or unfinished ([COUPON?]/[DATE?]) in "
+                         f"{len(bad)} row(s) - fix them in the Review file first:\n" + "\n".join(lines))
+    return rv
+
+
+def _value(src, ctx, cfg):
+    if src.startswith("const:"):
+        txt = src[6:]
+        return txt.format(**{k: v for k, v in ctx.items() if isinstance(v, (str, int))}) if "{" in txt else txt
+    r = ctx["row"]
+    if src == "end_date":
+        return ctx["end_date"]
+    if src == "fund_id":
+        return ctx["fund_id"]
+    if src == "side_code":
+        return ctx["side_code"]
+    if src == "side":
+        return ctx["side"]
+    if src == "seq":
+        return ctx["seq"]
+    if src == "name":
+        return r["Final Name"]
+    if src in ("position", "nominal"):
+        return _num(r["Nominal"])
+    if src in ("principal_base", "amount"):
+        return _num(r["Amount"])
+    if src == "maturity":
+        return _to_datetime(r.get("Maturity"))
+    if src == "coupon":
+        return _num(r.get("Coupon"))
+    if src == "rate":
+        zcp = str(r.get("Final Name", "")).upper().find("ZCP") >= 0
+        t = _rate_text(r.get("Coupon"), cfg["rate_format"])
+        return t if t is not None else (cfg["rate_format"].format(0.0) if zcp else None)
+    if src == "soi_fund":
+        return None if _isna(r.get("SOI Fund")) else str(r.get("SOI Fund"))
+    if src == "asset_id":
+        return None if _isna(r.get("Asset ID")) else str(r.get("Asset ID"))
+    raise ValueError(f"GDI profile: unknown source '{src}'")
+
+
+def _write_one(rv, template_path, out_path, period, cfg, log):
+    from openpyxl import load_workbook
+    from openpyxl.utils import column_index_from_string
+
+    wb = load_workbook(template_path)
+    ws = wb.active
+    start = int(cfg["data_start_row"])
+    cols = {column_index_from_string(k): v for k, v in cfg["columns"].items()}
+    side_col = next((c for c, s in cols.items() if s == "side_code"), None)
+
+    # style of a purchases / sales row = style of the first template row with P / S in the side column
+    max_col = ws.max_column
+    style_rows = {"P": start, "S": start}
+    if side_col:
+        seen = set()
+        for r in range(start, ws.max_row + 1):
+            v = str(ws.cell(r, side_col).value or "").strip().upper()
+            if v in ("P", "S") and v not in seen:
+                style_rows[v] = r
+                seen.add(v)
+    styles = {k: [copy.copy(ws.cell(r, c)._style) for c in range(1, max_col + 1)] for k, r in style_rows.items()}
+
+    # clear template data rows (values only; row formats are re-applied below)
+    for r in range(start, ws.max_row + 1):
+        for c in range(1, max_col + 1):
+            ws.cell(r, c).value = None
+
+    end_date = parse_period(period)
+    out_row = start
+    per_fund = {}
+    seq_file = 0
+    for fid in list(dict.fromkeys(rv["Fund Id"])):
+        g = rv[rv["Fund Id"] == fid]
+        seq = 0
+        for side, code in (("Purchases", "P"), ("Sales", "S")):
+            s = g[g["Side"] == side].copy()
+            s["_no"] = pd.to_numeric(s["No"], errors="coerce")
+            for _, row in s.sort_values("_no").iterrows():
+                seq += 1
+                seq_file += 1
+                ctx = {"row": row, "end_date": end_date, "fund_id": fid, "side": side, "side_code": code,
+                       "seq": seq if cfg["seq_scope"] == "fund" else seq_file}
+                for c, src in cols.items():
+                    ws.cell(out_row, c).value = _value(src, ctx, cfg)
+                for c in range(1, max_col + 1):
+                    cell = ws.cell(out_row, c)
+                    cell._style = copy.copy(styles[code][c - 1])
+                    if isinstance(cell.value, datetime) and cell.number_format == "General":
+                        cell.number_format = "dd/mm/yyyy"       # template cell had no date format
+                out_row += 1
+                per_fund[fid] = per_fund.get(fid, 0) + 1
+    for r in range(out_row, ws.max_row + 1):          # leftover template placeholder rows: no colours
+        for c in range(1, max_col + 1):
+            ws.cell(r, c).style = "Normal"
+    wb.save(out_path)
+    return out_row - start, per_fund
+
+
+def export_gdi(review_path, template_path, out_path, period, profile_gdi=None, log=print):
+    """Returns list of written files. Raises ValueError on blocking problems."""
+    cfg = _cfg(profile_gdi)
+    tpl = Path(template_path)
+    if not tpl.exists():
+        raise ValueError(f"GDI template not found: {tpl}\nPut the EMPTY GDI template there "
+                         "(clients/<client>/GDI_template.xlsx) or set gdi.template in the profile.")
+    rv = _rows_from_review(review_path)
+    out_path = Path(out_path)
+    written = []
+    if cfg.get("file_per_fund"):
+        for fid in list(dict.fromkeys(rv["Fund Id"])):
+            target = out_path.with_name(f"{out_path.stem}_{fid}{out_path.suffix}")
+            n, _ = _write_one(rv[rv["Fund Id"] == fid], tpl, target, period, cfg, log)
+            log(f"  fund {fid}: {n} rows -> {target.name}")
+            written.append(target)
+    else:
+        n, per = _write_one(rv, tpl, out_path, period, cfg, log)
+        log(f"  {n} rows, {len(per)} fund(s) -> {out_path.name}")
+        for fid, k in per.items():
+            log(f"    fund {fid}: {k} rows")
+        written.append(out_path)
+    return written
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 5:
+        print("usage: gdi_export.py <Review.xlsx> <GDI_template.xlsx> <out.xlsx> <period dd/mm/yyyy>")
+        sys.exit(1)
+    export_gdi(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])

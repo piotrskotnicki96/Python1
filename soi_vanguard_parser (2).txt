@@ -1,0 +1,376 @@
+"""
+Vanguard SOI parser (UCITS ETF umbrella annual/interim report, one PDF for ~40 funds, 1000+ pages).
+
+Returns the SAME tables as soi_pdf_parser.parse_pdf (securities, suspicious lines, sector checks), so the
+matcher / Review / export work unchanged. The launcher picks this parser when the client profile has
+    "soi": {"layout": "vanguard"}
+
+How it reads the book
+  1. Page index (fast): first ~700 characters of every page -> fund name (first line) and the heading.
+     Uses `pdftotext` when installed, else `pypdf`, else pdfplumber. The index is cached next to the PDF's
+     cache folder, so the 1000+ pages are scanned only once.
+  2. For each fund the SOI block = from the page headed "Statement of Investments" up to the page before the
+     next heading (Statement of Assets and Liabilities / Operations / Significant Portfolio Changes ...).
+  3. Only those pages are opened with pdfplumber. Equity pages are two-column: the page is cut in half and
+     each half is read on its own (left half first, then right half). Bond pages are one column.
+  4. A name wraps onto two lines ("Corporate Travel Management / Ltd."); lines without numbers are glued to the
+     name of the next line that has numbers (the numbers may sit on the first, second or a separate line).
+  5. Derivatives (futures, forwards) and everything below "Total Transferable Securities" are skipped.
+"""
+
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+
+HEAD_CHARS = 700
+OTHER_HEADINGS = ("Statement of Assets and Liabilities", "Statement of Operations", "Significant Portfolio Changes",
+                  "Statement of Changes in Net Assets", "Statement of Cash Flows", "Notes to the Financial Statements")
+STOP_LINE_RE = re.compile(r"^(Number of\s*Contracts|Financial Derivative Instruments|OTC Financial Derivative|"
+                          r"Total Investments|Other Assets and Liabilities)", re.I)
+NOISE_RE = re.compile(r"^(\(\d{1,2} \w+ \d{4}:.*\)|Financial Statements|Statement of Investments|\d{1,2} \w+ \d{4}|\.\.|Number of|Shares|"
+                      r"Principal|Coupon|Maturity|Date|Fair Value|% of Total|Net Assets|US Dollars|[A-Z]{3} \([^)]*\)|"
+                      r"\d{1,4})$", re.I)
+SECTION_RE = re.compile(r"^(?P<title>.+?)\s+\(?\d+(?:\.\d+)?%\)?(?:\s+\(\d{1,2} \w+ \d{4}:\s*\(?[\d.]+%?\)?\))?$")
+SUBTOTAL_RE = re.compile(r"^(?:[-–]\s+){1,3}(?P<fv>\d[\d,]*)\s+(?P<pct>\(?\d+\.\d\d%\)?)$")
+NUMS_ONLY_RE = re.compile(r"^[\d,.\s%()—–-]+$")   # e.g. unlabeled subtotal "23,508,893 20.34%"
+DASH = r"[-–—]"
+TOTAL_RE = re.compile(r"^Total (?P<what>Equities|Fixed Income|Funds|Bonds|Transferable Securities|Collective Investment Schemes|Investment Funds)\s+(?:[\d,]+\s+)?"
+                      r"(?P<fv>[\d,]+)\s+\(?[\d.]+%\)?$", re.I)
+DEBT_RE = re.compile(
+    r"^(?:(?P<name>.+?)\s+)?(?P<ccy>[A-Z]{3}|[€$£¥])?(?P<prin>\d[\d,]*)\s+(?P<cpn>\d{1,2}(?:\.\d{1,4})?%|ZCP)\s+"
+    r"(?P<date>\d{1,2}/\d{1,2}/\d{4}|Perpetual)\s+(?P<fv>\d[\d,]*|" + DASH + r")\s+(?P<pct>\(?\d+\.\d\d%\)?)$", re.I)
+EQ_RE = re.compile(
+    r"^(?:(?P<name>.+?)\s+)?(?P<hold>\d[\d,]*)\s+(?P<fv>\d[\d,]*|" + DASH + r")\s+(?P<pct>\(?\d+\.\d\d%\)?)$")
+
+
+def _num(tok):
+    tok = (tok or "").strip()
+    if not tok or re.fullmatch(DASH, tok):
+        return None
+    neg = tok.startswith("(") and tok.endswith(")")
+    tok = tok.strip("()").replace(",", "").replace("%", "")
+    try:
+        v = float(tok)
+    except ValueError:
+        return None
+    return -v if neg else v
+
+
+def _date(txt):
+    if "/" not in txt:
+        return None
+    d, m, y = (int(x) for x in txt.split("/"))
+    try:
+        return date(y, m, d)
+    except ValueError:
+        return None
+
+
+# ------------------------------------------------------------------ page index
+def _heads_pdftotext(pdf_path):
+    exe = shutil.which("pdftotext")
+    if not exe:
+        return None
+    r = subprocess.run([exe, "-layout", str(pdf_path), "-"], capture_output=True, timeout=600)
+    if r.returncode != 0:
+        return None
+    return [p[:HEAD_CHARS * 2] for p in r.stdout.decode("utf-8", "ignore").split("\f")][:-1]
+
+
+def _heads_pypdf(pdf_path, log=print):
+    try:
+        import pypdf
+    except ImportError:
+        return None
+    rd = pypdf.PdfReader(str(pdf_path))
+    out = []
+    for i, pg in enumerate(rd.pages):
+        out.append((pg.extract_text() or "")[:HEAD_CHARS * 2])
+        if (i + 1) % 100 == 0:
+            log(f"    indexed {i + 1} pages ...")
+    return out
+
+
+def _heads_pdfminer(pdf_path, log=print):
+    """Plain text of every page WITHOUT layout analysis (several times faster than pdfplumber)."""
+    import io
+    from pdfminer.converter import TextConverter
+    from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
+    from pdfminer.pdfpage import PDFPage
+    rm = PDFResourceManager()
+    out = []
+    with open(pdf_path, "rb") as fh:
+        for i, pg in enumerate(PDFPage.get_pages(fh)):
+            buf = io.StringIO()
+            conv = TextConverter(rm, buf, laparams=None)
+            PDFPageInterpreter(rm, conv).process_page(pg)
+            conv.close()
+            out.append(buf.getvalue()[:HEAD_CHARS * 2])
+            if (i + 1) % 100 == 0:
+                log(f"    indexed {i + 1} pages ...")
+    return out
+
+
+def _heads_plumber(pdf_path):
+    import pdfplumber
+    out = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for pg in pdf.pages:
+            top = pg.crop((0, 0, pg.width, pg.height * 0.22))
+            out.append(top.extract_text() or "")
+    return out
+
+
+def page_heads(pdf_path, cache_dir=None, log=print):
+    """List with the beginning of every page's text (cached by file size + mtime)."""
+    pdf_path = Path(pdf_path)
+    st = pdf_path.stat()
+    key = f"{pdf_path.name}|{st.st_size}|{int(st.st_mtime)}"
+    tag = hashlib.md5(str(pdf_path.resolve()).encode("utf-8")).hexdigest()[:10]
+    cache = Path(cache_dir) / f"vanguard_index_{tag}.json" if cache_dir else None
+    if cache and cache.exists():
+        try:
+            data = json.loads(cache.read_text(encoding="utf-8"))
+            if data.get("key") == key:
+                return data["heads"]
+        except (OSError, ValueError):
+            pass
+    log(f"  indexing pages of {pdf_path.name} (one-time per file, 1-3 minutes; result is cached) ...")
+    heads = _heads_pdftotext(pdf_path) or _heads_pypdf(pdf_path, log)
+    if not heads:
+        try:
+            heads = _heads_pdfminer(pdf_path, log)
+        except ImportError:
+            heads = _heads_plumber(pdf_path)
+    heads = [h[:HEAD_CHARS] for h in heads]
+    if cache:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"key": key, "heads": heads}), encoding="utf-8")
+        except OSError:
+            pass
+    return heads
+
+
+FUND_LINE_RE = re.compile(r"^Vanguard\b.*(?:UCITS ETF|ETF|Fund|Funds plc|plc)$")
+FUND_FLAT_RE = re.compile(r"Vanguard .{3,90}?(?:UCITS ETF|Index Fund|Fund)\b")
+
+
+def fund_name_of(head):
+    """Fund name from the beginning of a page: first line that looks like a Vanguard fund name; text extracted in
+    stream order (pypdf / pdfminer) may have it after 'Financial Statements', so fall back to a search."""
+    lines = [ln.strip() for ln in head.split("\n") if ln.strip()]
+    for ln in lines[:12]:
+        if FUND_LINE_RE.match(ln):
+            return ln
+    m = FUND_FLAT_RE.search(head)
+    if m:
+        return m.group(0).strip()
+    return lines[0] if lines else ""
+
+
+def fund_blocks(heads):
+    """-> list of {'fund', 'pages'(1-based)} for every Statement of Investments in the book."""
+    first_line = fund_name_of
+
+    blocks, cur = [], None
+    for i, h in enumerate(heads):
+        fund = first_line(h)
+        has_soi = "Statement of Investments" in h
+        other = any(x in h for x in OTHER_HEADINGS)
+        if has_soi and not other:
+            cur = {"fund": fund, "pages": [i + 1]}
+            blocks.append(cur)
+        elif cur and fund == cur["fund"] and not other and cur["pages"][-1] == i:
+            cur["pages"].append(i + 1)
+        else:
+            cur = None
+    return blocks
+
+
+# ------------------------------------------------------------------ page parsing
+HEADER_VOCAB = re.compile(r"(Financial Statements|Statement of Investments|\d{1,2} \w+ \d{4}|Number of|Shares|Principal|Coupon|"
+                          r"Maturity|Date|Fair Value|% of Total|Net Assets|US Dollars|\([^)]{1,4}\)|[A-Z]{3}(?= \()|\$|\.\.|\(\$\))",
+                          re.I)
+
+
+def is_header_line(txt):
+    """True when the line consists only of column-header words (even several on one line)."""
+    return bool(txt) and not HEADER_VOCAB.sub(" ", txt).strip(" .()$€£")
+
+
+def _clean(txt):
+    return re.sub(r"[​‌‍ ]", " ", txt).strip()
+
+
+def _lines(region):
+    return [(_clean(ln["text"]), ln["top"]) for ln in region.extract_text_lines(return_chars=False)
+            if _clean(ln["text"])]
+
+
+def _page_regions(page):
+    """-> (kind, [regions in reading order]); kind 'debt' | 'equity'."""
+    all_lines = _lines(page)
+    top = [txt for txt, t in all_lines if t < page.height * 0.30]
+    n_num = sum(len(re.findall(r"Number of", t)) for t in top)
+    debt = any(re.search(r"\bCoupon\b", t) for t in top)
+    # y where derivatives / totals start -> everything from there is not securities
+    y_stop = page.height
+    for txt, ytop in all_lines:
+        if STOP_LINE_RE.match(txt) and ytop > page.height * 0.12:
+            y_stop = min(y_stop, ytop - 1)
+    x_max = page.width
+    if any("Analysis of Total Assets" in t for t, _y in all_lines):   # table left, analysis right
+        for w in page.extract_words():
+            if w["text"] == "Analysis" and w["x0"] > page.width * 0.40:
+                x_max = min(x_max, w["x0"] - 4)
+    body = (0, 0, x_max, y_stop)
+    if debt or n_num < 2:
+        return ("debt" if debt else "equity"), [page.crop(body)]
+    mid = page.width / 2
+    return "equity", [page.crop((0, 0, mid, y_stop)), page.crop((mid, 0, x_max, y_stop))]
+
+
+def parse_fund(pdf, fund, pages, state_rows, suspicious, checks):
+    section, sector = "", ""
+    n_start = len(state_rows)
+    buffer = []
+    acc = {"sum": 0.0, "n": 0}
+    first_page = True
+    for pno in pages:
+        page = pdf.pages[pno - 1]
+        kind, regions = _page_regions(page)
+        for ri, region in enumerate(regions):
+            for txt, _top in _lines(region):
+                if txt == fund or NOISE_RE.match(txt) or is_header_line(txt) or (NUMS_ONLY_RE.match(txt) and len(txt.split()) < 3):
+                    buffer = []
+                    continue
+                m = SECTION_RE.match(txt)
+                if m and not m.group("title").strip()[-1].isdigit() and not (EQ_RE.match(txt) or DEBT_RE.match(txt)):
+                    title = m.group("title").strip()
+                    buffer = []
+                    if title.lower() in ("transferable securities", "other transferable securities", "collective investment schemes"):
+                        section = title
+                    elif title.lower().endswith(("investment schemes", "investment funds")):
+                        section = title
+                        sector = ""
+                    elif title.lower() in ("equities", "fixed income", "funds", "bonds", "preferred stock", "rights", "warrants"):
+                        section = title
+                        sector = ""
+                    else:
+                        sector = title
+                    acc.update(sum=0.0, n=0)
+                    continue
+                tm = TOTAL_RE.match(txt)
+                if tm:
+                    what = tm.group("what")
+                    pdf_tot = _num(tm.group("fv"))
+                    mine = [r for r in state_rows[n_start:]
+                            if what.lower().startswith(("transferable", "investment funds"))
+                            or r["Section"].lower() == what.lower()
+                            or (what.lower().startswith("collective") and r["Section"].lower().endswith("investment schemes"))]
+                    parsed = round(sum(r["Fair_Value"] or 0 for r in mine), 2)
+                    diff = round((pdf_tot or 0) - parsed, 2)
+                    checks.append({"Fund": fund, "Page": pno, "Section": "TOTAL", "Sector": what,
+                                   "PDF_Subtotal": pdf_tot, "Parsed_Total": parsed, "Difference": diff,
+                                   "Securities": len(mine), "Missing_Fair_Value": 0,
+                                   "Status": "OK" if abs(diff) <= max(2, len(mine)) else "DIFF"})
+                    buffer = []
+                    continue
+                st = SUBTOTAL_RE.match(txt)
+                if st and sector:
+                    pdf_sub = _num(st.group("fv"))
+                    diff = round((pdf_sub or 0) - acc["sum"], 2)
+                    checks.append({"Fund": fund, "Page": pno, "Section": section, "Sector": sector,
+                                   "PDF_Subtotal": pdf_sub, "Parsed_Total": round(acc["sum"], 2), "Difference": diff,
+                                   "Securities": acc["n"], "Missing_Fair_Value": 0,
+                                   "Status": "OK" if abs(diff) <= max(2, acc["n"]) else "DIFF"})
+                    acc.update(sum=0.0, n=0)
+                    buffer = []
+                    continue
+                d = DEBT_RE.match(txt) if kind == "debt" else None
+                e = None if d else EQ_RE.match(txt)
+                if d is not None or e is not None:
+                    m_ = d or e
+                    name_part = (m_.group("name") or "").strip()
+                    name = " ".join(buffer + ([name_part] if name_part else [])).strip()
+                    wrapped = bool(buffer)
+                    check_prev = ""
+                    if not name:
+                        suspicious.append({"Fund": fund, "Page": pno, "Line": txt, "Buffer": ""})
+                        buffer = []
+                        continue
+                    fv = _num(m_.group("fv"))
+                    row = {"Fund": fund, "Page": pno, "Section": section, "Sector": sector,
+                           "Footnotes": "", "Fair_Value": fv, "Pct": _num(m_.group("pct")),
+                           "Wrapped": wrapped, "Continuation_Page": False, "Check_prev_line": check_prev,
+                           "Raw_line": txt}
+                    if d is not None:
+                        cpn_txt = d.group("cpn").upper()
+                        row.update({"Type": "Debt", "Issuer": name,
+                                    "Coupon": None if cpn_txt == "ZCP" else float(cpn_txt.rstrip("%")),
+                                    "ZCP": cpn_txt == "ZCP", "Maturity": _date(d.group("date")),
+                                    # published as: Issuer 5.25% 25/3/2029
+                                    "Name_publication": f"{name} {d.group('cpn')} {d.group('date')}",
+                                    "Holding": _num(d.group("prin")), "Currency": d.group("ccy") or ""})
+                    else:
+                        row.update({"Type": "Equity", "Issuer": name, "Coupon": None, "ZCP": False, "Maturity": None,
+                                    "Name_publication": name, "Holding": _num(e.group("hold")), "Currency": ""})
+                    state_rows.append(row)
+                    acc["sum"] += fv or 0.0
+                    acc["n"] += 1
+                    buffer = []
+                else:
+                    buffer = (buffer + [txt])[-3:]
+        first_page = False
+
+
+COLS_SUS = ["Fund", "Page", "Line", "Buffer"]
+COLS_CHK = ["Fund", "Page", "Section", "Sector", "PDF_Subtotal", "Parsed_Total", "Difference",
+            "Securities", "Missing_Fair_Value", "Status"]
+
+
+def parse_pdf(pdf_path, soi_titles=None, ignore_contains=None, funds=None, cache_dir=None, log=print):
+    """funds: optional list of fund-name fragments (case-insensitive); others are skipped (saves time)."""
+    import pdfplumber
+    heads = page_heads(pdf_path, cache_dir, log)
+    blocks = fund_blocks(heads)
+    if funds:
+        fl = [f.lower() for f in funds]
+        blocks = [b for b in blocks if any(f in b["fund"].lower() for f in fl)]
+    rows, sus, chk = [], [], []
+    with pdfplumber.open(pdf_path) as pdf:
+        for b in blocks:
+            n0 = len(rows)
+            parse_fund(pdf, b["fund"], b["pages"], rows, sus, chk)
+            log(f"  {b['fund']}: pages {b['pages'][0]}-{b['pages'][-1]}, {len(rows) - n0} securities")
+    return pd.DataFrame(rows), pd.DataFrame(sus, columns=COLS_SUS), pd.DataFrame(chk, columns=COLS_CHK)
+
+
+def parse_path(path, soi_titles=None, ignore_contains=None, log=print, funds=None, cache_dir=None):
+    p = Path(path)
+    files = sorted(f for f in p.glob("*.pdf") if not f.name.startswith("~$")) if p.is_dir() else [p]
+    if not files:
+        raise ValueError(f"No PDF files found in: {p}")
+    parts = []
+    for f in files:
+        df, sus, chk = parse_pdf(f, soi_titles, ignore_contains, funds=funds, cache_dir=cache_dir, log=log)
+        for d in (df, sus, chk):
+            d.insert(0, "Source_File", f.name)
+        parts.append((df, sus, chk))
+    return tuple(pd.concat([pt[i] for pt in parts], ignore_index=True) for i in range(3))
+
+
+if __name__ == "__main__":
+    src = sys.argv[1]
+    fl = sys.argv[2:] or None
+    df, sus, chk = parse_path(src, funds=fl)
+    print(len(df), "securities;", len(sus), "suspicious;", len(chk), "checks,",
+          int((chk["Status"] != "OK").sum()) if len(chk) else 0, "with difference")
