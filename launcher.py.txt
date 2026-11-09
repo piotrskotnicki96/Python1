@@ -1,0 +1,617 @@
+"""
+P&S Automation - Launcher v0.4
+
+Folder structure (the launcher creates missing folders itself):
+    PS_Automation/
+        launcher.py
+        soi_pdf_parser.py
+        soi_vanguard_parser.py        <- only for clients with "soi": {"layout": "vanguard"}
+        matcher.py
+        word_builder.py
+        gdi_export.py                 <- GDI export (clients with a GDI template, e.g. Vanguard)
+        clients/_template.json        <- full reference profile (not a client)
+        clients/<client>/             <- EVERYTHING of one client in one folder:
+            profile.json                 settings that differ from the defaults (SOI titles, name style, layout ...)
+            mappings.xlsx                approved Asset ID -> name mappings
+            funds.xlsx                   fund map: Fund Id -> SOI fund name, currency, order
+            settings.json                last used paths, period and layout choice of this client
+        clients/_default/             <- the same for the built-in "(default)" client (no profile.json)
+        data/cache/                   <- slim copies of Bloomberg/PVAL files (safe to delete)
+        output/<client>/<period>/
+
+Older layouts (clients/<client>.json + data/mappings_<client>.xlsx + data/funds_<client>.xlsx) are migrated
+automatically on start: the files are copied into the client's folder and the old ones renamed to *.migrated
+(nothing is deleted).
+
+Run:  python launcher.py
+"""
+
+import copy
+import json
+import shutil
+import sys
+import threading
+import traceback
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, simpledialog, messagebox
+
+import soi_pdf_parser as soi
+import soi_vanguard_parser as soi_vg
+import matcher
+import word_builder
+import gdi_export
+import profile_import
+
+# Folder with clients/, data/, output/. Built as .exe (PyInstaller) __file__ points into the program's
+# internal/temp folder, so data would be lost or hidden there: use the folder of the .exe instead.
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+CLIENTS_DIR = APP_DIR / "clients"
+OUTPUT_DIR = APP_DIR / "output"
+SETTINGS_FILE = APP_DIR / "launcher_settings.json"
+DATA_DIR = APP_DIR / "data"
+
+# Client profile template. New client = copy of _template.json under a new name + ONLY the keys that differ.
+# Matching/name settings come straight from matcher.DEFAULTS, so the launcher and matcher.py run alone
+# always use the same rules (earlier the template kept its own, shorter copy of strip_suffixes).
+TEMPLATE_PROFILE = {
+    "client_name": "New client",
+    "soi": {
+        "titles": list(soi.SOI_TITLES),
+        "ignore_contains": list(soi.IGNORE_CONTAINS),
+        "layout": "standard",        # "vanguard" = one book PDF with many funds, 2-column equity pages
+    },
+    "alteryx": copy.deepcopy(matcher.DEFAULTS["alteryx"]),
+    "name_format": copy.deepcopy(matcher.DEFAULTS["name_format"]),
+    "fund_map": {},
+    "matching": copy.deepcopy(matcher.DEFAULTS["matching"]),
+    "output": copy.deepcopy(word_builder.OUTPUT_DEFAULTS),  # step 3 layout (Word/PDF)
+}
+
+
+DEFAULT_CLIENT = "(default)"
+SETTINGS_KEYS = ["period", "sales_layout", "alteryx", "soi_cy", "soi_py", "bloomberg", "pval"]
+MIGRATION_LOG = []
+
+
+def client_dir(client):
+    """Folder of one client; the built-in '(default)' client lives in clients/_default."""
+    return CLIENTS_DIR / ("_default" if client in ("", DEFAULT_CLIENT) else client)
+
+
+def migrate_legacy():
+    """clients/<c>.json, data/mappings_<c>.xlsx, data/funds_<c>.xlsx -> clients/<c>/profile.json|mappings.xlsx|funds.xlsx.
+    Copies, then renames the old file to *.migrated - nothing is deleted. Safe to run on every start."""
+    log = MIGRATION_LOG
+    for p in sorted(CLIENTS_DIR.glob("*.json")):
+        if p.stem == "_template":
+            continue
+        d = CLIENTS_DIR / p.stem.strip()
+        target = d / "profile.json"
+        try:
+            if not target.exists():
+                d.mkdir(exist_ok=True)
+                shutil.copy2(p, target)
+            p.replace(p.with_name(p.name + ".migrated"))
+            log.append(f"migrated profile {p.name} -> {p.stem}/profile.json")
+        except OSError as e:
+            log.append(f"WARNING: could not migrate {p.name} ({e})")
+    for kind, new_name in (("mappings", "mappings.xlsx"), ("funds", "funds.xlsx")):
+        for f in sorted(DATA_DIR.glob(f"{kind}_*.xlsx")):
+            client = f.stem[len(kind) + 1:].strip()      # 'funds_Vanguard .xlsx' (stray space) -> 'Vanguard'
+            if not client:
+                continue
+            d = CLIENTS_DIR / ("_default" if client == "default" else client)
+            try:
+                d.mkdir(exist_ok=True)
+                if not (d / new_name).exists():
+                    shutil.copy2(f, d / new_name)
+                f.replace(f.with_name(f.name + ".migrated"))
+                log.append(f"migrated {f.name} -> {d.name}/{new_name}")
+            except OSError as e:
+                log.append(f"WARNING: could not migrate {f.name} ({e})")
+
+
+def ensure_structure():
+    CLIENTS_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    migrate_legacy()
+    tpl = CLIENTS_DIR / "_template.json"
+    if not tpl.exists():
+        tpl.write_text(json.dumps(TEMPLATE_PROFILE, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_clients():
+    """'(default)' = built-in settings, no profile needed. Other entries = clients/<name>/profile.json
+    (overrides only). A flat clients/<name>.json that has not been migrated yet is still understood."""
+    out = {DEFAULT_CLIENT: None}
+    for d in sorted(CLIENTS_DIR.iterdir()):
+        if d.is_dir() and not d.name.startswith("_") and (d / "profile.json").exists():
+            out[d.name] = d / "profile.json"
+    for p in sorted(CLIENTS_DIR.glob("*.json")):
+        if p.stem != "_template" and p.stem not in out:
+            out[p.stem] = p
+    return out
+
+
+def load_client_settings(client):
+    p = client_dir(client) / "settings.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_client_settings(client, data):
+    """Last used paths/period of ONE client. Returns an error message, or None."""
+    try:
+        d = client_dir(client)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "settings.json").write_text(
+            json.dumps({k: data.get(k, "") for k in SETTINGS_KEYS}, indent=2, ensure_ascii=False), encoding="utf-8")
+        return None
+    except OSError as e:
+        return f"could not save the settings of client '{client}' ({e})"
+
+
+def deep_merge(base, override):
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def load_settings():
+    """Last used paths. Missing file = first run; a damaged file is ignored (only convenience data)."""
+    if not SETTINGS_FILE.exists():
+        return {}
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    """Returns an error message, or None when saved."""
+    try:
+        SETTINGS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        return None
+    except OSError as e:
+        return f"could not save launcher settings ({e})"
+
+
+class Launcher(tk.Tk):
+    FIELDS = [
+        ("alteryx", "Alteryx output (folder)", "dir"),
+        ("soi_cy", "SOI CY (PDF or folder)", "pdf"),
+        ("soi_py", "SOI PY (PDF or folder)", "pdf"),
+        ("bloomberg", "Bloomberg (optional, file or folder)", "xlsx"),
+        ("pval", "PVAL (optional, file or folder)", "xlsx"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.title("P&S Automation v0.4")
+        self.geometry("900x600")
+        self.settings = load_settings()          # global file: only the last used client
+        self.clients = load_clients()
+        self.vars = {}
+        self._active_client = None
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        for m in MIGRATION_LOG:
+            self._log(f"Migration: {m}")
+
+    # ---------- UI ----------
+    def _build(self):
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(1, weight=1)
+
+        ttk.Label(frm, text="Client").grid(row=0, column=0, sticky="w", pady=3)
+        saved = self.settings.get("client", "")
+        self.client_var = tk.StringVar(value=saved if saved in self.clients else DEFAULT_CLIENT)
+        self.client_cb = ttk.Combobox(frm, textvariable=self.client_var, values=list(self.clients), state="readonly")
+        self.client_cb.grid(row=0, column=1, sticky="ew", pady=3)
+        self.client_cb.bind("<<ComboboxSelected>>", lambda e: self._on_client_changed())
+        cbf = ttk.Frame(frm)
+        cbf.grid(row=0, column=2, padx=4, sticky="w")
+        ttk.Button(cbf, text="New client", command=self._on_new_client).pack(side="left")
+        ttk.Button(cbf, text="Client folder", command=self._open_client_folder).pack(side="left", padx=2)
+        ttk.Button(cbf, text="Refresh", command=self._refresh_clients).pack(side="left")
+
+        ttk.Label(frm, text="Period (dd/mm/yyyy)").grid(row=1, column=0, sticky="w", pady=3)
+        self.period_var = tk.StringVar(value="")
+        ttk.Entry(frm, textvariable=self.period_var).grid(row=1, column=1, sticky="ew", pady=3)
+
+        for i, (key, label, kind) in enumerate(self.FIELDS, start=2):
+            ttk.Label(frm, text=label).grid(row=i, column=0, sticky="w", pady=3)
+            v = tk.StringVar(value="")
+            self.vars[key] = v
+            ttk.Entry(frm, textvariable=v).grid(row=i, column=1, sticky="ew", pady=3)
+            bf = ttk.Frame(frm)
+            bf.grid(row=i, column=2, padx=4, sticky="w")
+            if kind in ("pdf", "xlsx"):  # single file or a folder of files
+                ttk.Button(bf, text="File", width=6, command=lambda k=key, t=kind: self._browse(k, t)).pack(side="left")
+                ttk.Button(bf, text="Folder", width=7, command=lambda k=key: self._browse(k, "dir")).pack(side="left")
+            else:
+                ttk.Button(bf, text="...", width=6, command=lambda k=key, t=kind: self._browse(k, t)).pack(side="left")
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=8, column=0, columnspan=3, pady=10, sticky="ew")
+        self.b1 = ttk.Button(btns, text="1. Load SOI (CY + PY)", command=lambda: self._run(self.step_soi))
+        self.b2 = ttk.Button(btns, text="2. Match → Review Excel", command=lambda: self._run(self.step_match))
+        self.b4 = ttk.Button(btns, text="Save approved names → mappings", command=self._on_save_mappings)
+        self.b5 = ttk.Button(btns, text="Save fund map", command=self._on_save_fund_map)
+        self.b3 = ttk.Button(btns, text="3. Generate Word / PDF", command=self._on_word)
+        self.b6 = ttk.Button(btns, text="Layout from Word → profile", command=self._on_import_word)
+        self.b7 = ttk.Button(btns, text="Layout from PDF → profile", command=self._on_import_pdf)
+        self.b8 = ttk.Button(btns, text="3b. Export GDI", command=self._on_gdi)
+        for b in (self.b1, self.b2, self.b4, self.b5, self.b3, self.b8, self.b6, self.b7):
+            b.pack(side="left", expand=True, fill="x", padx=3)
+        ttk.Label(btns, text="Sales on new page:").pack(side="left", padx=(10, 2))
+        self.sales_layout = tk.StringVar(value="(profile)")
+        ttk.Combobox(btns, textvariable=self.sales_layout, width=9, state="readonly",
+                     values=["(profile)", "always", "auto", "fit"]).pack(side="left")
+
+        self.log = tk.Text(frm, height=16, state="disabled", wrap="word")
+        self.log.grid(row=9, column=0, columnspan=3, sticky="nsew")
+        frm.rowconfigure(9, weight=1)
+        ttk.Button(frm, text="Open output folder", command=self._open_output).grid(row=10, column=0, columnspan=3, pady=6)
+
+        self._log("Each client has its own folder clients/<name>/ (profile.json, mappings.xlsx, funds.xlsx, settings.json). "
+                  "'(default)' uses built-in settings. Use 'New client' to add one.")
+        self._load_client_into_fields(self.client_var.get())
+
+    # ---------- per-client settings ----------
+    def _fields_snapshot(self):
+        return {"period": self.period_var.get(), "sales_layout": self.sales_layout.get(),
+                **{k: v.get() for k, v in self.vars.items()}}
+
+    def _store_client_settings(self):
+        """Saves the fields under the client they were filled in for (not the one just selected)."""
+        if self._active_client is None:
+            return
+        err = save_client_settings(self._active_client, self._fields_snapshot())
+        if err:
+            self._log(f"WARNING: {err}")
+
+    def _load_client_into_fields(self, client):
+        st = load_client_settings(client)
+        if not st and client == self.settings.get("client"):      # first start after the upgrade: old global values
+            st = {k: self.settings.get(k, "") for k in SETTINGS_KEYS}
+        self.period_var.set(st.get("period", ""))
+        self.sales_layout.set(st.get("sales_layout", "(profile)") or "(profile)")
+        for k, v in self.vars.items():
+            v.set(st.get(k, ""))
+        self._active_client = client
+
+    def _on_client_changed(self):
+        self._store_client_settings()
+        self._load_client_into_fields(self.client_var.get())
+        self._log(f"Client: {self.client_var.get()} -> {client_dir(self.client_var.get())}")
+
+    def _on_close(self):
+        self._store_client_settings()
+        save_settings({"client": self.client_var.get()})
+        self.destroy()
+
+    def _on_new_client(self):
+        name = simpledialog.askstring("New client", "Client name (becomes the folder name):", parent=self)
+        name = "".join(ch for ch in (name or "") if ch.isalnum() or ch in " _-").strip()
+        if not name or name.startswith("_") or name == DEFAULT_CLIENT:
+            self._log("New client cancelled (no valid name).")
+            return
+        d = CLIENTS_DIR / name
+        if (d / "profile.json").exists():
+            self._log(f"Client '{name}' already exists - selected.")
+        else:
+            cur = self.client_var.get()
+            src = self.clients.get(cur)
+            data = {"client_name": name}
+            if src and messagebox.askyesno("New client", f"Copy the profile of '{cur}' as the starting point?\n"
+                                           "(No = empty profile with built-in settings.)", parent=self):
+                try:
+                    data = json.loads(src.read_text(encoding="utf-8"))
+                    data["client_name"] = name
+                except (OSError, ValueError) as e:
+                    self._log(f"WARNING: could not copy the profile of '{cur}' ({e}) - empty profile created.")
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "profile.json").write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._log(f"Created {d / 'profile.json'}")
+        self._store_client_settings()
+        self.clients = load_clients()
+        self.client_cb["values"] = list(self.clients)
+        self.client_var.set(name)
+        self._load_client_into_fields(name)
+
+    def _open_client_folder(self):
+        import os
+        d = client_dir(self.client_var.get())
+        d.mkdir(parents=True, exist_ok=True)
+        os.startfile(d) if hasattr(os, "startfile") else self._log(str(d))
+
+    def _browse(self, key, kind):
+        if kind == "dir":
+            p = filedialog.askdirectory()
+        else:
+            ft = [("PDF", "*.pdf")] if kind == "pdf" else [("Excel / CSV", "*.xlsx *.xls *.csv")]
+            p = filedialog.askopenfilename(filetypes=ft + [("All files", "*.*")])
+        if p:
+            self.vars[key].set(p)
+
+    def _refresh_clients(self):
+        self.clients = load_clients()
+        self.client_cb["values"] = list(self.clients)
+        self._log(f"Profiles: {', '.join(self.clients)}")
+
+    def _log(self, msg):
+        def _w():
+            self.log.configure(state="normal")
+            self.log.insert("end", f"[{datetime.now():%H:%M:%S}] {msg}\n")
+            self.log.see("end")
+            self.log.configure(state="disabled")
+        self.after(0, _w)
+
+    def _open_output(self):
+        import os
+        path = self._out_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        os.startfile(path) if hasattr(os, "startfile") else self._log(str(path))
+
+    # ---------- logic ----------
+    def _snapshot(self):
+        """All field values, read ONCE on the main thread when a step starts. The worker thread uses only this
+        copy, so changing the client/period/paths while a step runs cannot mix two clients' inputs."""
+        return {"client": self.client_var.get(), "period": self.period_var.get(),
+                "sales_layout": self.sales_layout.get(),
+                **{k: v.get() for k, v in self.vars.items()}}
+
+    def _profile(self, snap):
+        """Built-in settings + (optionally) the client's JSON on top - the JSON may contain only what differs."""
+        prof = json.loads(json.dumps(TEMPLATE_PROFILE))
+        path = self.clients.get(snap["client"])
+        self._log(f"Client profile: {snap['client']} -> {path if path else 'built-in settings (no JSON)'}")
+        if path:
+            try:
+                deep_merge(prof, json.loads(path.read_text(encoding="utf-8")))
+            except ValueError as e:
+                raise ValueError(f"The profile file has a JSON syntax error: {e}\nFile: {path}\n"
+                                 "Typical cause: a missing comma at the end of the previous line, or a missing quote/bracket.") from None
+        if snap.get("sales_layout") in ("always", "auto", "fit"):      # dropdown overrides the profile
+            prof.setdefault("output", {})["sales_new_page"] = snap["sales_layout"]
+        return prof
+
+    def _out_dir(self, snap=None):
+        snap = snap or self._snapshot()
+        period = snap["period"].replace("/", "-").replace("\\", "-").replace("..", "") or "no_period"
+        client = snap["client"]
+        client = "default" if client in ("", DEFAULT_CLIENT) else client
+        return OUTPUT_DIR / client / period
+
+    def _run(self, fn):
+        snap = self._snapshot()
+        self._store_client_settings()
+        err = save_settings({"client": snap["client"]})
+        if err:
+            self._log(f"WARNING: {err}")
+        btns = (self.b1, self.b2, self.b4, self.b5, self.b3, self.b8, self.b6, self.b7)
+        for b in btns:
+            b.configure(state="disabled")
+
+        def worker():
+            try:
+                fn(snap)
+            except Exception as e:
+                self._log(f"ERROR: {e}")
+                self._log(traceback.format_exc())
+            finally:
+                self.after(0, lambda: [b.configure(state="normal") for b in btns])
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _parse_soi(self, path, prof):
+        """Standard parser, or the Vanguard book parser when the client profile says so."""
+        cfg = prof["soi"]
+        if cfg.get("layout") == "vanguard":
+            return soi_vg.parse_path(path, cfg.get("titles"), cfg.get("ignore_contains"), log=self._log,
+                                     funds=cfg.get("funds") or None, cache_dir=DATA_DIR / "cache")
+        return soi.parse_path(path, cfg.get("titles"), cfg.get("ignore_contains"), log=self._log)
+
+    def step_soi(self, snap):
+        prof = self._profile(snap)
+        out = self._out_dir(snap)
+        out.mkdir(parents=True, exist_ok=True)
+        for key, label in (("soi_cy", "SOI_CY"), ("soi_py", "SOI_PY")):
+            path = snap[key]
+            if not path:
+                self._log(f"{label}: skipped (no file)")
+                continue
+            self._log(f"{label}: reading {Path(path).name} ...")
+            df, sus, chk = self._parse_soi(path, prof)
+            target = out / f"{label}_parsed.xlsx"
+            soi.save_excel(df, sus, target, chk)
+            bad = int((chk["Status"] != "OK").sum()) if not chk.empty else 0
+            self._log(f"{label}: sector subtotal check - {len(chk)} checked, {bad} with difference")
+            funds = df["Fund"].nunique() if not df.empty else 0
+            self._log(f"{label}: securities {len(df)} | funds {funds} | to review {len(sus)}")
+            self._log(f"{label}: saved {target}")
+        self._log("Step 1 done.")
+
+    def _mappings_file(self, snap):
+        """One mapping file per client: clients/<client>/mappings.xlsx"""
+        d = client_dir(snap["client"])
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "mappings.xlsx"
+
+    def _on_save_mappings(self):
+        p = filedialog.askopenfilename(title="Select the REVIEWED Review file", initialdir=str(self._out_dir()),
+                                       filetypes=[("Excel", "*.xlsx")])
+        if p:
+            self._run(lambda snap: self.step_save_mappings(snap, p))
+
+    def step_save_mappings(self, snap, review_path):
+        self._log(f"Saving approved names from {Path(review_path).name} ...")
+        matcher.save_mappings(review_path, self._mappings_file(snap), log=self._log)
+        self._log("Done. These names will be used automatically in the next Match run (status GREEN/YELLOW).")
+
+    def _fund_map_file(self, snap):
+        """One fund map per client: clients/<client>/funds.xlsx (Fund Id -> SOI fund name, PY name if renamed)."""
+        d = client_dir(snap["client"])
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "funds.xlsx"
+
+    def _on_save_fund_map(self):
+        p = filedialog.askopenfilename(title="Select the REVIEWED Review file (its Summary sheet is used)",
+                                       initialdir=str(self._out_dir()), filetypes=[("Excel", "*.xlsx")])
+        if p:
+            self._run(lambda snap: self.step_save_fund_map(snap, p))
+
+    def step_save_fund_map(self, snap, review_path):
+        self._log(f"Saving detected funds from {Path(review_path).name} ...")
+        matcher.save_fund_map(review_path, self._fund_map_file(snap), log=self._log)
+        self._log("Done. Next Match uses the fund map - funds are no longer detected automatically.")
+
+    def _on_word(self):
+        p = filedialog.askopenfilename(title="Select the REVIEWED Review file (Final Name is printed)",
+                                       initialdir=str(self._out_dir()), filetypes=[("Excel", "*.xlsx")])
+        if p:
+            self._run(lambda snap: self.step_word(snap, p))
+
+    def _on_gdi(self):
+        p = filedialog.askopenfilename(title="Select the REVIEWED Review file (Final Name is exported to GDI)",
+                                       initialdir=str(self._out_dir()), filetypes=[("Excel", "*.xlsx")])
+        if p:
+            self._run(lambda snap: self.step_gdi(snap, p))
+
+    def step_gdi(self, snap, review_path):
+        if not snap["period"].strip():
+            raise ValueError("Enter the Period (dd/mm/yyyy) - it is the snapshot date in the GDI file.")
+        prof = self._profile(snap)
+        gcfg = prof.get("gdi") or {}
+        tpl = Path(gcfg.get("template") or "GDI_template.xlsx")
+        if not tpl.is_absolute():
+            tpl = client_dir(snap["client"]) / tpl
+        tpl = gdi_export.find_template(tpl)
+        out = self._out_dir(snap)
+        out.mkdir(parents=True, exist_ok=True)
+        target = out / f"GDI_{datetime.now():%Y%m%d_%H%M}{'.xlsm' if tpl.suffix.lower() in ('.xlsm', '.xltm') else '.xlsx'}"
+        self._log(f"Building GDI from {Path(review_path).name} using template {tpl} ...")
+        files = gdi_export.export_gdi(review_path, tpl, target, snap["period"], gcfg, log=self._log)
+        self._log(f"Step 3b done. {len(files)} GDI file(s) in {out}. Check a few rows against the Review before loading to GDI.")
+
+    def _on_import_word(self):
+        p = filedialog.askopenfilename(title="Word note to read the layout from (e.g. last year's note)",
+                                       filetypes=[("Word", "*.docx")])
+        if not p:
+            return
+        cur = self.client_var.get()
+        name = simpledialog.askstring("Client profile",
+                                      "Save the layout to clients/<name>/profile.json\n(an existing profile keeps its other settings).\n\nClient name:",
+                                      initialvalue="" if cur == DEFAULT_CLIENT else cur, parent=self)
+        name = "".join(ch for ch in (name or "") if ch.isalnum() or ch in " _-").strip()
+        if not name or name == "_template":
+            self._log("Layout import cancelled (no valid client name).")
+            return
+        self._run(lambda snap: self.step_import_word(p, name))
+
+    def _on_import_pdf(self):
+        p = filedialog.askopenfilename(title="PDF of the ORIGINAL published note (the real printed layout)",
+                                       filetypes=[("PDF", "*.pdf")])
+        if not p:
+            return
+        cur = self.client_var.get()
+        name = simpledialog.askstring("Client profile",
+                                      "Save the layout to clients/<name>/profile.json\n(an existing profile keeps its other settings).\n\nClient name:",
+                                      initialvalue="" if cur == DEFAULT_CLIENT else cur, parent=self)
+        name = "".join(ch for ch in (name or "") if ch.isalnum() or ch in " _-").strip()
+        if not name or name == "_template":
+            self._log("Layout import cancelled (no valid client name).")
+            return
+        self._run(lambda snap: self.step_import_pdf(p, name))
+
+    def step_import_pdf(self, pdf_path, client):
+        diff, rows = profile_import.extract_output_from_pdf(pdf_path)
+        self._log(f"Layout measured on {Path(pdf_path).name}:")
+        self._log(profile_import.format_report(rows))
+        if not diff:
+            self._log("Nothing to save (no differences from the defaults, or the PDF does not look like the note).")
+            return
+        self.after(0, lambda: self._confirm_save_profile(diff, client))
+
+    def step_import_word(self, docx_path, client):
+        diff, rows = profile_import.extract_output_settings(docx_path)
+        self._log(f"Layout read from {Path(docx_path).name}:")
+        self._log(profile_import.format_report(rows))
+        try:
+            self._log("Structure of the Word file (send this when the layout is read wrongly):\n"
+                      + profile_import.describe_structure(docx_path))
+        except Exception as e:                       # the dump is only a diagnostic aid
+            self._log(f"(structure dump failed: {e})")
+        if not diff:
+            self._log("Nothing to save (no differences from the defaults, or the file does not look like the note).")
+            return
+        self.after(0, lambda: self._confirm_save_profile(diff, client))
+
+    def _confirm_save_profile(self, diff, client):
+        """Runs on the main thread: the user sees what would be written and decides."""
+        lines = "\n".join(f"{k}: {str(v)[:60]}" for k, v in diff.items())
+        if messagebox.askyesno("Save layout to profile",
+                               f"Save {len(diff)} setting(s) to clients/{client}/profile.json?\n"
+                               f"(an existing profile is backed up as profile.json.bak)\n\n{lines}", parent=self):
+            p = profile_import.save_client_profile(diff, client, CLIENTS_DIR)
+            self._log(f"Saved {len(diff)} setting(s) -> {p}")
+            self._refresh_clients()
+            self._log(f"Pick client '{client}' in the list and generate a test note.")
+        else:
+            self._log("Layout NOT saved.")
+
+    def step_word(self, snap, review_path):
+        if not snap["period"].strip():
+            raise ValueError("Enter the Period (dd/mm/yyyy) - it is printed in the note header.")
+        out = self._out_dir(snap)
+        target = out / f"PS_Note_{datetime.now():%Y%m%d_%H%M}.docx"
+        self._log(f"Building Word from {Path(review_path).name} ...")
+        prof = self._profile(snap)
+        src = self.clients.get(snap["client"])
+        self._log(f"Profile: {snap['client']} ({(src.parent.name + '/' + src.name) if src else 'built-in settings, no JSON file'}) | "
+                  f"page_numbers={prof['output'].get('page_numbers')} | first_page_number={prof['output'].get('first_page_number')}")
+        word_builder.build_note(review_path, target, prof, snap["period"],
+                                                   fund_map_path=self._fund_map_file(snap), log=self._log)
+        self._log("Step 3 done. Check the Word_Check file and read the document before publishing.")
+
+    def step_match(self, snap):
+        prof = self._profile(snap)
+        out = self._out_dir(snap)
+        out.mkdir(parents=True, exist_ok=True)
+        folder = snap["alteryx"]
+        if not folder:
+            raise ValueError("Select the folder with Alteryx files.")
+        dfs = {}
+        for key, label in (("soi_cy", "SOI_CY"), ("soi_py", "SOI_PY")):
+            path = snap[key]
+            if path:
+                self._log(f"{label}: reading {Path(path).name} ...")
+                dfs[key] = self._parse_soi(path, prof)[0]
+                self._log(f"{label}: {len(dfs[key])} securities")
+            else:
+                dfs[key] = None
+                self._log(f"{label}: no file - skipped")
+        externals = {label: snap[key] for key, label in (("bloomberg", "BLOOMBERG"), ("pval", "PVAL"))
+                     if snap[key]}
+        target = out / f"Review_{datetime.now():%Y%m%d_%H%M}.xlsx"
+        matcher.run_matching(folder, dfs["soi_cy"], dfs["soi_py"], prof, target,
+                             mappings_path=self._mappings_file(snap), log=self._log,
+                             fund_map_path=self._fund_map_file(snap), external_paths=externals,
+                             cache_dir=APP_DIR / "data" / "cache")
+        self._log("Step 2 done. Open the Review file and check the yellow and red rows.")
+
+
+if __name__ == "__main__":
+    ensure_structure()
+    Launcher().mainloop()
