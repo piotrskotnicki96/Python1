@@ -71,7 +71,7 @@ TEMPLATE_PROFILE = {
 
 
 DEFAULT_CLIENT = "(default)"
-SETTINGS_KEYS = ["period", "sales_layout", "alteryx", "soi_cy", "soi_py", "bloomberg", "pval"]
+SETTINGS_KEYS = ["period", "sales_layout", "alteryx", "soi_cy", "soi_py", "bloomberg", "pval", "tj", "tj_on"]
 MIGRATION_LOG = []
 
 
@@ -193,12 +193,13 @@ class Launcher(tk.Tk):
         ("soi_py", "SOI PY (PDF or folder)", "pdf"),
         ("bloomberg", "Bloomberg (optional, file or folder)", "xlsx"),
         ("pval", "PVAL (optional, file or folder)", "xlsx"),
+        ("tj", "Trade Journals (Vanguard, folder / file)", "xlsx"),
     ]
 
     def __init__(self):
         super().__init__()
         self.title("P&S Automation v0.4")
-        self.geometry("900x600")
+        self.geometry("980x720")
         self.settings = load_settings()          # global file: only the last used client
         self.clients = load_clients()
         self.vars = {}
@@ -209,61 +210,143 @@ class Launcher(tk.Tk):
             self._log(f"Migration: {m}")
 
     # ---------- UI ----------
-    def _build(self):
-        frm = ttk.Frame(self, padding=12)
-        frm.pack(fill="both", expand=True)
-        frm.columnconfigure(1, weight=1)
+    BG, CARD, ACCENT, ACCENT_D, TXT, MUTED = "#f3f5f9", "#ffffff", "#2563eb", "#1d4ed8", "#1f2937", "#6b7280"
 
-        ttk.Label(frm, text="Client").grid(row=0, column=0, sticky="w", pady=3)
+    def _style(self):
+        st = ttk.Style(self)
+        try:
+            st.theme_use("clam")
+        except tk.TclError:
+            pass
+        f = ("Segoe UI", 10)
+        self.configure(bg=self.BG)
+        st.configure(".", font=f, background=self.BG, foreground=self.TXT)
+        st.configure("TFrame", background=self.BG)
+        st.configure("Card.TFrame", background=self.CARD, relief="flat")
+        st.configure("Card.TLabel", background=self.CARD, foreground=self.TXT)
+        st.configure("Card.TCheckbutton", background=self.CARD, foreground=self.TXT)
+        st.configure("Muted.TLabel", background=self.CARD, foreground=self.MUTED, font=("Segoe UI", 9))
+        st.configure("Head.TLabel", background=self.BG, font=("Segoe UI", 16, "bold"), foreground=self.TXT)
+        st.configure("Sub.TLabel", background=self.BG, foreground=self.MUTED)
+        st.configure("Section.TLabel", background=self.BG, font=("Segoe UI", 10, "bold"), foreground=self.MUTED)
+        st.configure("TEntry", fieldbackground="#ffffff", bordercolor="#d1d5db", lightcolor="#d1d5db",
+                     darkcolor="#d1d5db", padding=5)
+        st.configure("TCombobox", fieldbackground="#ffffff", bordercolor="#d1d5db", padding=4)
+        st.configure("TButton", padding=(10, 6), background="#e5e7eb", bordercolor="#d1d5db", relief="flat")
+        st.map("TButton", background=[("active", "#d1d5db"), ("disabled", "#eef0f3")],
+               foreground=[("disabled", "#9ca3af")])
+        st.configure("Small.TButton", padding=(8, 4), font=("Segoe UI", 9))
+        st.configure("Accent.TButton", background=self.ACCENT, foreground="#ffffff", font=("Segoe UI", 10, "bold"),
+                     padding=(12, 8))
+        st.map("Accent.TButton", background=[("active", self.ACCENT_D), ("disabled", "#93b4f5")],
+               foreground=[("disabled", "#ffffff")])
+        st.configure("Horizontal.TProgressbar", troughcolor="#e5e7eb", background=self.ACCENT, bordercolor=self.BG)
+
+    def _card(self, parent, title):
+        ttk.Label(parent, text=title.upper(), style="Section.TLabel").pack(anchor="w", pady=(10, 3))
+        c = ttk.Frame(parent, style="Card.TFrame", padding=(14, 10))
+        c.pack(fill="x")
+        c.columnconfigure(1, weight=1)
+        return c
+
+    def _build(self):
+        self._style()
+        self.minsize(900, 640)
+        root = ttk.Frame(self, padding=(18, 14))
+        root.pack(fill="both", expand=True)
+
+        head = ttk.Frame(root)
+        head.pack(fill="x")
+        ttk.Label(head, text="P&S Automation", style="Head.TLabel").pack(side="left")
+        ttk.Label(head, text="  Significant purchases & sales  |  v0.4", style="Sub.TLabel").pack(side="left", pady=(6, 0))
+
+        # --- client + period
+        c1 = self._card(root, "Client")
+        ttk.Label(c1, text="Client", style="Card.TLabel").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 12))
         saved = self.settings.get("client", "")
         self.client_var = tk.StringVar(value=saved if saved in self.clients else DEFAULT_CLIENT)
-        self.client_cb = ttk.Combobox(frm, textvariable=self.client_var, values=list(self.clients), state="readonly")
-        self.client_cb.grid(row=0, column=1, sticky="ew", pady=3)
+        self.client_cb = ttk.Combobox(c1, textvariable=self.client_var, values=list(self.clients), state="readonly")
+        self.client_cb.grid(row=0, column=1, sticky="ew", pady=4)
         self.client_cb.bind("<<ComboboxSelected>>", lambda e: self._on_client_changed())
-        cbf = ttk.Frame(frm)
-        cbf.grid(row=0, column=2, padx=4, sticky="w")
-        ttk.Button(cbf, text="New client", command=self._on_new_client).pack(side="left")
-        ttk.Button(cbf, text="Client folder", command=self._open_client_folder).pack(side="left", padx=2)
-        ttk.Button(cbf, text="Refresh", command=self._refresh_clients).pack(side="left")
-
-        ttk.Label(frm, text="Period (dd/mm/yyyy)").grid(row=1, column=0, sticky="w", pady=3)
+        cbf = ttk.Frame(c1, style="Card.TFrame")
+        cbf.grid(row=0, column=2, padx=(8, 0), sticky="e")
+        for t, cmd in (("New client", self._on_new_client), ("Client folder", self._open_client_folder),
+                       ("Refresh", self._refresh_clients)):
+            ttk.Button(cbf, text=t, style="Small.TButton", command=cmd).pack(side="left", padx=2)
+        ttk.Label(c1, text="Period (dd/mm/yyyy)", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=4, padx=(0, 12))
         self.period_var = tk.StringVar(value="")
-        ttk.Entry(frm, textvariable=self.period_var).grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Entry(c1, textvariable=self.period_var, width=16).grid(row=1, column=1, sticky="w", pady=4)
 
-        for i, (key, label, kind) in enumerate(self.FIELDS, start=2):
-            ttk.Label(frm, text=label).grid(row=i, column=0, sticky="w", pady=3)
+        # --- inputs
+        c2 = self._card(root, "Input files")
+        self.vars = {}
+        for i, (key, label, kind) in enumerate(self.FIELDS):
+            if key == "tj":      # optional check, Vanguard only: tick box instead of a plain label
+                on = tk.StringVar(value="")
+                self.vars["tj_on"] = on
+                ttk.Checkbutton(c2, text=label, variable=on, onvalue="1", offvalue="",
+                                style="Card.TCheckbutton").grid(row=i, column=0, sticky="w", pady=4, padx=(0, 12))
+            else:
+                ttk.Label(c2, text=label, style="Card.TLabel").grid(row=i, column=0, sticky="w", pady=4, padx=(0, 12))
             v = tk.StringVar(value="")
             self.vars[key] = v
-            ttk.Entry(frm, textvariable=v).grid(row=i, column=1, sticky="ew", pady=3)
-            bf = ttk.Frame(frm)
-            bf.grid(row=i, column=2, padx=4, sticky="w")
+            ttk.Entry(c2, textvariable=v).grid(row=i, column=1, sticky="ew", pady=4)
+            bf = ttk.Frame(c2, style="Card.TFrame")
+            bf.grid(row=i, column=2, padx=(8, 0), sticky="e")
             if kind in ("pdf", "xlsx"):  # single file or a folder of files
-                ttk.Button(bf, text="File", width=6, command=lambda k=key, t=kind: self._browse(k, t)).pack(side="left")
-                ttk.Button(bf, text="Folder", width=7, command=lambda k=key: self._browse(k, "dir")).pack(side="left")
+                ttk.Button(bf, text="File", style="Small.TButton", width=7,
+                           command=lambda k=key, t=kind: self._browse(k, t)).pack(side="left", padx=2)
+                ttk.Button(bf, text="Folder", style="Small.TButton", width=7,
+                           command=lambda k=key: self._browse(k, "dir")).pack(side="left", padx=2)
             else:
-                ttk.Button(bf, text="...", width=6, command=lambda k=key, t=kind: self._browse(k, t)).pack(side="left")
+                ttk.Button(bf, text="Folder", style="Small.TButton", width=7,
+                           command=lambda k=key, t=kind: self._browse(k, t)).pack(side="left", padx=2)
 
-        btns = ttk.Frame(frm)
-        btns.grid(row=8, column=0, columnspan=3, pady=10, sticky="ew")
-        self.b1 = ttk.Button(btns, text="1. Load SOI (CY + PY)", command=lambda: self._run(self.step_soi))
-        self.b2 = ttk.Button(btns, text="2. Match → Review Excel", command=lambda: self._run(self.step_match))
-        self.b4 = ttk.Button(btns, text="Save approved names → mappings", command=self._on_save_mappings)
-        self.b5 = ttk.Button(btns, text="Save fund map", command=self._on_save_fund_map)
-        self.b3 = ttk.Button(btns, text="3. Generate Word / PDF", command=self._on_word)
-        self.b6 = ttk.Button(btns, text="Layout from Word → profile", command=self._on_import_word)
-        self.b7 = ttk.Button(btns, text="Layout from PDF → profile", command=self._on_import_pdf)
-        self.b8 = ttk.Button(btns, text="3b. Export GDI", command=self._on_gdi)
-        for b in (self.b1, self.b2, self.b4, self.b5, self.b3, self.b8, self.b6, self.b7):
+        # --- workflow
+        ttk.Label(root, text="WORKFLOW", style="Section.TLabel").pack(anchor="w", pady=(12, 3))
+        wf = ttk.Frame(root)
+        wf.pack(fill="x")
+        self.b1 = ttk.Button(wf, text="1  Load SOI (CY + PY)", style="Accent.TButton", command=lambda: self._run(self.step_soi))
+        self.b2 = ttk.Button(wf, text="2  Match → Review Excel", style="Accent.TButton", command=lambda: self._run(self.step_match))
+        self.b3 = ttk.Button(wf, text="3  Generate Word / PDF", style="Accent.TButton", command=self._on_word)
+        self.b8 = ttk.Button(wf, text="3b  Export GDI", style="Accent.TButton", command=self._on_gdi)
+        for b in (self.b1, self.b2, self.b3, self.b8):
             b.pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Label(btns, text="Sales on new page:").pack(side="left", padx=(10, 2))
+
+        tools = ttk.Frame(root)
+        tools.pack(fill="x", pady=(8, 0))
+        self.b4 = ttk.Button(tools, text="Save approved names → mappings", command=self._on_save_mappings)
+        self.b5 = ttk.Button(tools, text="Save fund map", command=self._on_save_fund_map)
+        self.b6 = ttk.Button(tools, text="Layout from Word → profile", command=self._on_import_word)
+        self.b7 = ttk.Button(tools, text="Layout from PDF → profile", command=self._on_import_pdf)
+        for b in (self.b4, self.b5, self.b6, self.b7):
+            b.pack(side="left", expand=True, fill="x", padx=3)
+        ttk.Label(tools, text="Sales on new page", style="Sub.TLabel").pack(side="left", padx=(12, 4))
         self.sales_layout = tk.StringVar(value="(profile)")
-        ttk.Combobox(btns, textvariable=self.sales_layout, width=9, state="readonly",
+        ttk.Combobox(tools, textvariable=self.sales_layout, width=9, state="readonly",
                      values=["(profile)", "always", "auto", "fit"]).pack(side="left")
 
-        self.log = tk.Text(frm, height=16, state="disabled", wrap="word")
-        self.log.grid(row=9, column=0, columnspan=3, sticky="nsew")
-        frm.rowconfigure(9, weight=1)
-        ttk.Button(frm, text="Open output folder", command=self._open_output).grid(row=10, column=0, columnspan=3, pady=6)
+        # --- log
+        ttk.Label(root, text="LOG", style="Section.TLabel").pack(anchor="w", pady=(12, 3))
+        lf = ttk.Frame(root)
+        lf.pack(fill="both", expand=True)
+        self.log = tk.Text(lf, height=12, state="disabled", wrap="word", bg="#111827", fg="#e5e7eb",
+                           insertbackground="#e5e7eb", relief="flat", padx=10, pady=8, font=("Consolas", 9),
+                           borderwidth=0, highlightthickness=0)
+        sb = ttk.Scrollbar(lf, command=self.log.yview)
+        self.log.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+        self.log.tag_configure("err", foreground="#f87171")
+        self.log.tag_configure("warn", foreground="#fbbf24")
+        self.log.tag_configure("ok", foreground="#34d399")
+        self.log.tag_configure("ts", foreground="#6b7280")
+
+        foot = ttk.Frame(root)
+        foot.pack(fill="x", pady=(8, 0))
+        self.progress = ttk.Progressbar(foot, mode="indeterminate", length=160)
+        self.progress.pack(side="left")
+        ttk.Button(foot, text="Open output folder", command=self._open_output).pack(side="right")
 
         self._log("Each client has its own folder clients/<name>/ (profile.json, mappings.xlsx, funds.xlsx, settings.json). "
                   "'(default)' uses built-in settings. Use 'New client' to add one.")
@@ -354,7 +437,11 @@ class Launcher(tk.Tk):
     def _log(self, msg):
         def _w():
             self.log.configure(state="normal")
-            self.log.insert("end", f"[{datetime.now():%H:%M:%S}] {msg}\n")
+            self.log.insert("end", f"[{datetime.now():%H:%M:%S}] ", "ts")
+            low = str(msg).lstrip().lower()
+            tag = "err" if low.startswith(("error", "traceback")) else "warn" if low.startswith("warning") \
+                else "ok" if ("done" in low[:40]) else ()
+            self.log.insert("end", f"{msg}\n", tag)
             self.log.see("end")
             self.log.configure(state="disabled")
         self.after(0, _w)
@@ -404,6 +491,7 @@ class Launcher(tk.Tk):
         btns = (self.b1, self.b2, self.b4, self.b5, self.b3, self.b8, self.b6, self.b7)
         for b in btns:
             b.configure(state="disabled")
+        self.progress.start(12)
 
         def worker():
             try:
@@ -412,10 +500,49 @@ class Launcher(tk.Tk):
                 self._log(f"ERROR: {e}")
                 self._log(traceback.format_exc())
             finally:
-                self.after(0, lambda: [b.configure(state="normal") for b in btns])
+                self.after(0, lambda: ([b.configure(state="normal") for b in btns], self.progress.stop()))
         threading.Thread(target=worker, daemon=True).start()
 
     def _parse_soi(self, path, prof):
+        """Parsed SOI with a disk cache: the same PDF(s) + same SOI settings + same parser code = the saved result
+        (step 2 no longer re-reads a 1000+ page book that step 1 already parsed)."""
+        import hashlib
+        import pickle
+        import time
+        cfg = prof["soi"]
+        try:
+            p = Path(path)
+            files = [p] if p.is_file() else sorted(f for f in p.rglob("*") if f.is_file() and f.suffix.lower() == ".pdf")
+            parts = [(str(f.resolve()), f.stat().st_size, int(f.stat().st_mtime)) for f in files]
+            code = [(m.__file__, int(Path(m.__file__).stat().st_mtime)) for m in (soi, soi_vg)]
+            key = hashlib.md5(json.dumps([parts, code, cfg], sort_keys=True, default=str).encode("utf-8")).hexdigest()
+            cache = DATA_DIR / "cache" / f"soi_parsed_{key}.pkl"
+        except (OSError, TypeError, ValueError):
+            cache = None
+        if cache is not None and cache.exists():
+            try:
+                with open(cache, "rb") as fh:
+                    res = pickle.load(fh)
+                self._log(f"  parsed SOI loaded from cache ({Path(path).name})")
+                return res
+            except Exception:  # noqa: BLE001 - damaged cache = parse again
+                pass
+        t0 = time.time()
+        res = self._parse_soi_raw(path, prof)
+        self._log(f"  SOI parsed in {time.time() - t0:.0f}s")
+        if cache is not None:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                for old in cache.parent.glob("soi_parsed_*.pkl"):      # keep the cache folder small
+                    if time.time() - old.stat().st_mtime > 14 * 86400:
+                        old.unlink(missing_ok=True)
+                with open(cache, "wb") as fh:
+                    pickle.dump(res, fh)
+            except Exception:  # noqa: BLE001 - cache is optional
+                pass
+        return res
+
+    def _parse_soi_raw(self, path, prof):
         """Standard parser, or the Vanguard book parser when the client profile says so."""
         cfg = prof["soi"]
         if cfg.get("layout") == "vanguard":
@@ -608,6 +735,7 @@ class Launcher(tk.Tk):
         matcher.run_matching(folder, dfs["soi_cy"], dfs["soi_py"], prof, target,
                              mappings_path=self._mappings_file(snap), log=self._log,
                              fund_map_path=self._fund_map_file(snap), external_paths=externals,
+                             tj_path=(snap.get("tj") or None) if snap.get("tj_on") == "1" else None,
                              cache_dir=APP_DIR / "data" / "cache")
         self._log("Step 2 done. Open the Review file and check the yellow and red rows.")
 
