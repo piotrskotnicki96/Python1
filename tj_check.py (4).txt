@@ -1,0 +1,395 @@
+"""Trade Journal check (Vanguard): one Trade Journal per fund (Account column = Fund Id).
+
+Does what the manual pivot does - Purchases = Event Type BUY + BUYCANCEL, Sales = SELL + SELLCANCEL,
+rows NAME + Primary Asset ID, values Sum of Position / Sum of Principal Base - and compares it with the Review rows
+(Nominal vs Position, Amount vs Principal Base). BUY / SELL count as absolute values, *CANCEL as minus.
+It only ADDS columns / sheets to the Review, it never changes names or amounts.
+"""
+import re
+from pathlib import Path
+
+import pandas as pd
+
+BUY_EV, SELL_EV = {"BUY": 1, "BUYCANCEL": -1}, {"SELL": 1, "SELLCANCEL": -1}
+ALIASES = {
+    "account": ["account", "account number", "fund", "fund id"],
+    "event": ["event type", "event"],
+    "name": ["name", "security name", "description"],
+    "aid": ["primary asset id", "primary asset", "asset id"],
+    "pos": ["position", "quantity"],
+    "pb": ["principal base", "principal (base)"],
+}
+EXTS = (".xlsx", ".xlsm", ".xls", ".csv")
+TOL_POS, TOL_AMT = 0.5, 1.0
+
+
+def _aid(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    t = str(v).strip().upper()
+    return t[:-2] if t.endswith(".0") else t
+
+
+def _acct(v):
+    return _aid(v).lstrip("0") or _aid(v)
+
+
+def _num(v):
+    try:
+        return float(str(v).replace(",", "").strip())
+    except ValueError:
+        return 0.0
+
+
+def _read_one(path, log):
+    p = Path(path)
+    if p.suffix.lower() == ".csv":
+        raw = pd.read_csv(p, header=None, dtype=object)
+    else:
+        xl = pd.ExcelFile(p)
+        sheet = next((s for s in xl.sheet_names if s.strip().lower() == "trade journal"), xl.sheet_names[0])
+        raw = xl.parse(sheet, header=None, dtype=object)
+    hdr_row = None
+    for i in range(min(25, len(raw))):
+        vals = {str(v).strip().lower() for v in raw.iloc[i] if pd.notna(v)}
+        if "event type" in vals and ("primary asset id" in vals or "asset id" in vals):
+            hdr_row = i
+            break
+    if hdr_row is None:
+        raise ValueError(f"Trade Journal {p.name}: header row with 'Event Type' and 'Primary Asset ID' not found")
+    df = raw.iloc[hdr_row + 1:].copy()
+    df.columns = [str(c).strip() for c in raw.iloc[hdr_row]]
+    low = {c.lower(): c for c in df.columns}
+    cols = {}
+    for k, al in ALIASES.items():
+        cols[k] = next((low[a] for a in al if a in low), None)
+    miss = [k for k in ("event", "aid", "pos", "pb", "account") if cols[k] is None]
+    if miss:
+        raise ValueError(f"Trade Journal {p.name}: missing column(s) {miss}; found: {list(df.columns)[:40]}")
+    out = pd.DataFrame({
+        "Fund Id": [_acct(v) for v in df[cols["account"]]],
+        "Event": [str(v).strip().upper() if pd.notna(v) else "" for v in df[cols["event"]]],
+        "Name": df[cols["name"]] if cols["name"] else "",
+        "Asset ID": [_aid(v) for v in df[cols["aid"]]],
+        "pos": [_num(v) for v in df[cols["pos"]]],
+        "pb": [_num(v) for v in df[cols["pb"]]],
+        "n": 1, "File": p.name,
+    })
+    return out[out["Asset ID"] != ""]
+
+
+import hashlib
+import pickle
+import re as _re
+import time
+import zipfile
+import xml.etree.ElementTree as ET
+
+_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_COL = _re.compile(r"[A-Z]+")
+
+
+def _sheet_path(z, want="trade journal"):
+    wb = ET.fromstring(z.read("xl/workbook.xml"))
+    sheets = [(s.get("name"), s.get(_RNS + "id")) for s in wb.iter(_NS + "sheet")]
+    rid = next((r for n, r in sheets if n.strip().lower() == want), sheets[0][1])
+    rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+    for r in rels:
+        if r.get("Id") == rid:
+            t = r.get("Target")
+            return t.lstrip("/") if t.startswith("/") else "xl/" + t
+    raise ValueError("sheet not found")
+
+
+def _shared_subset(z, wanted, log=None):
+    """Shared strings by index, ONLY the wanted ones (a Trade Journal can hold millions of unique strings;
+    loading them all is what ran out of memory)."""
+    out = {}
+    if not wanted or "xl/sharedStrings.xml" not in z.namelist():
+        return out
+    last = max(wanted)
+    root = None
+    i = 0
+    for ev, el in ET.iterparse(z.open("xl/sharedStrings.xml"), events=("start", "end")):
+        if root is None:
+            root = el
+        if ev != "end" or el.tag != _NS + "si":
+            continue
+        if i in wanted:
+            out[i] = "".join(t.text or "" for t in el.iter(_NS + "t"))
+        i += 1
+        el.clear()
+        root.clear()
+        if i > last:
+            break
+    return out
+
+
+def _cell_token(c):
+    """(kind, value): kind 's' = shared string index, 'v' = literal text / number."""
+    t = c.get("t")
+    if t == "inlineStr":
+        return ("v", "".join(x.text or "" for x in c.iter(_NS + "t")))
+    v = c.find(_NS + "v")
+    if v is None or v.text is None:
+        return None
+    return ("s", int(v.text)) if t == "s" else ("v", v.text)
+
+
+_ROW_RE = _re.compile(rb'<row\b([^>]*?)(?:/>|>(.*?)</row>)', _re.S)
+_RNUM_RE = _re.compile(rb'\br="(\d+)"')
+_ATTR_T = _re.compile(rb'\bt="(\w+)"')
+_TXT_RE = _re.compile(rb'<t[^>]*>(.*?)</t>', _re.S)
+_V_RE = _re.compile(rb'<v>(.*?)</v>', _re.S)
+
+
+def _unesc(b):
+    t = b.decode("utf-8", "replace")
+    if "&" in t:
+        from xml.sax.saxutils import unescape
+        t = unescape(t, {"&quot;": '"', "&apos;": "'"})
+    return t
+
+
+def _rows(z, path, limit=None, keep=None):
+    """Yields (row number, {column letter: token}) per non-empty row. Reads the raw sheet XML in big chunks and
+    pulls ONLY the wanted columns out with a regex (in C) - no XML objects for the 60+ columns we do not need."""
+    cols = sorted(keep) if keep else None
+    cell_re = _re.compile((rb'<c r="(' + b"|".join(c.encode() for c in cols) + rb')\d+"([^>]*?)(?:/>|>(.*?)</c>)')
+                          if cols else rb'<c r="([A-Z]+)\d+"([^>]*?)(?:/>|>(.*?)</c>)', _re.S)
+    n = 0
+    buf = b""
+    with z.open(path) as fh:
+        done = False
+        while not done:
+            chunk = fh.read(1 << 24)
+            if not chunk:
+                done = True
+                end = len(buf)
+            else:
+                buf += chunk
+                end = buf.rfind(b"</row>")
+                if end < 0:
+                    continue
+                end += 6
+            body, buf = buf[:end], buf[end:]
+            for m in _ROW_RE.finditer(body):
+                if m.group(2) is None:
+                    continue
+                cells = {}
+                for cm in cell_re.finditer(m.group(2)):
+                    inner = cm.group(3)
+                    if not inner:
+                        continue
+                    tm = _ATTR_T.search(cm.group(2))
+                    t = tm.group(1) if tm else b"n"
+                    if t == b"inlineStr":
+                        tok = ("v", "".join(_unesc(x) for x in _TXT_RE.findall(inner)))
+                    else:
+                        vm = _V_RE.search(inner)
+                        if vm is None:
+                            continue
+                        tok = ("s", int(vm.group(1))) if t == b"s" else ("v", _unesc(vm.group(1)))
+                    cells[cm.group(1).decode()] = tok
+                if cells:
+                    rm = _RNUM_RE.search(m.group(1))
+                    yield (int(rm.group(1)) if rm else 0), cells
+                    n += 1
+                    if limit and n >= limit:
+                        return
+
+
+def _read_stream(path, log):
+    """Streams the sheet XML (no pandas / openpyxl cell objects, shared strings loaded only where needed):
+    only the needed columns, aggregated on the fly. Works for files with millions of rows."""
+    need = {"event": ALIASES["event"], "aid": ALIASES["aid"], "pos": ALIASES["pos"], "pb": ALIASES["pb"],
+            "account": ALIASES["account"], "name": ALIASES["name"]}
+    with zipfile.ZipFile(path) as z:
+        sp = _sheet_path(z)
+        # 1) header: first rows only
+        head = list(_rows(z, sp, limit=40))     # [(row number, cells)]
+        idx = {tok[1] for _, r in head for tok in r.values() if tok[0] == "s"}
+        sst = _shared_subset(z, idx)
+
+        def txt(tok):
+            return str(sst.get(tok[1], "") if tok[0] == "s" else tok[1])
+
+        cols, hdr_pos = None, 0
+        for rn, r in head:
+            low = {txt(tok).strip().lower(): k for k, tok in r.items()}
+            if "event type" in low and ("primary asset id" in low or "asset id" in low):
+                cols = {k: next((low[x] for x in al if x in low), None) for k, al in need.items()}
+                hdr_pos = rn
+                break
+        if cols is None:
+            raise ValueError("header row with 'Event Type' and 'Primary Asset ID' not found")
+        miss = [k for k in ("event", "aid", "pos", "pb", "account") if cols[k] is None]
+        if miss:
+            raise ValueError(f"missing column(s) {miss}")
+        # 2) data: aggregate by raw tokens (strings are still indices here)
+        agg = {}
+        nrows = 0
+        for rn, cells in _rows(z, sp, keep={v for v in cols.values() if v}):
+            if rn <= hdr_pos:
+                continue
+            nrows += 1
+            ev, aid, ac = cells.get(cols["event"]), cells.get(cols["aid"]), cells.get(cols["account"])
+            if ev is None or aid is None:
+                continue
+            p, b = cells.get(cols["pos"]), cells.get(cols["pb"])
+            if (p and p[0] == "s") or (b and b[0] == "s"):
+                raise ValueError("Position / Principal Base stored as text")
+            k = (ev, aid, ac)
+            a = agg.get(k)
+            if a is None:
+                a = agg[k] = [cells.get(cols["name"]) if cols["name"] else None, 0.0, 0.0, 0]
+            a[1] += abs(_num(p[1] if p else 0))
+            a[2] += abs(_num(b[1] if b else 0))
+            a[3] += 1
+        # 3) resolve only the strings that are still needed
+        want = set()
+        for (ev, aid, ac), v in agg.items():
+            for tok in (ev, aid, ac, v[0]):
+                if tok is not None and tok[0] == "s":
+                    want.add(tok[1])
+        sst = _shared_subset(z, want)
+    rows = []
+    for (ev, aid, ac), v in agg.items():
+        e = txt(ev).strip().upper()
+        if e not in BUY_EV and e not in SELL_EV:
+            continue
+        ai = _aid(txt(aid))
+        if not ai:
+            continue
+        rows.append({"Fund Id": _acct(txt(ac)) if ac else "", "Event": e, "Name": txt(v[0]) if v[0] else "",
+                     "Asset ID": ai, "pos": v[1], "pb": v[2], "n": v[3], "File": Path(path).name})
+    out = pd.DataFrame(rows)
+    # same key can appear twice after resolving (e.g. 'BUY' and 'buy ') - sum them
+    if not out.empty:
+        out = out.groupby(["Fund Id", "Event", "Asset ID", "File"], as_index=False).agg(
+            Name=("Name", "first"), pos=("pos", "sum"), pb=("pb", "sum"), n=("n", "sum"))
+    log(f"  {Path(path).name}: {nrows:,} rows read, {len(out)} security lines")
+    return out
+
+
+def _read_cached(path, log, cache_dir):
+    p = Path(path)
+    cache = None
+    if cache_dir:
+        st = p.stat()
+        key = hashlib.md5(f"{p.resolve()}|{st.st_size}|{int(st.st_mtime)}|tj3".encode()).hexdigest()
+        cache = Path(cache_dir) / f"tj_{key}.pkl"
+        if cache.exists():
+            try:
+                with open(cache, "rb") as fh:
+                    log(f"  {p.name}: loaded from cache")
+                    return pickle.load(fh)
+            except Exception:  # noqa: BLE001
+                pass
+    t0 = time.time()
+    if p.suffix.lower() in (".xlsx", ".xlsm"):
+        try:
+            df = _read_stream(p, log)
+        except Exception as e:  # noqa: BLE001 - odd file: fall back to the slow reader
+            if "memory" in str(e).lower():
+                raise ValueError(f"file too large to read ({e})")
+            log(f"  {p.name}: fast reader failed ({e}) - slow reader")
+            df = _read_one(p, log)
+    else:
+        df = _read_one(p, log)
+    log(f"  {p.name}: read in {time.time() - t0:.0f}s")
+    if cache is not None:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache, "wb") as fh:
+                pickle.dump(df, fh)
+        except Exception:  # noqa: BLE001
+            pass
+    return df
+
+
+def load(path, log=print, cache_dir=None):
+    """File or folder -> long table of BUY/SELL(+CANCEL) rows."""
+    p = Path(path)
+    files = [p] if p.is_file() else sorted(f for f in p.iterdir()
+                                          if f.suffix.lower() in EXTS and not f.name.startswith("~$"))
+    parts = []
+    for f in files:
+        try:
+            parts.append(_read_cached(f, log, cache_dir))
+        except Exception as e:  # noqa: BLE001 - one bad file must not stop the others
+            log(f"  Trade Journal {f.name}: skipped ({e})")
+    if not parts:
+        raise ValueError(f"No readable Trade Journal in {p}")
+    tj = pd.concat(parts, ignore_index=True)
+    sgn = {**{e: (1, "Purchases", s) for e, s in BUY_EV.items()}, **{e: (1, "Sales", s) for e, s in SELL_EV.items()}}
+    tj = tj[tj["Event"].isin(sgn)].copy()
+    tj["Side"] = tj["Event"].map(lambda e: sgn[e][1])
+    sign = tj["Event"].map(lambda e: sgn[e][2])
+    tj["Position"] = tj["pos"].abs() * sign
+    tj["Principal Base"] = tj["pb"].abs() * sign
+    log(f"Trade Journal: {len(files)} file(s), {tj['Fund Id'].nunique()} fund(s), {len(tj)} BUY/SELL rows")
+    return tj
+
+
+def pivot(tj):
+    g = tj.groupby(["Fund Id", "Side", "Asset ID"], as_index=False).agg(
+        Name=("Name", "first"), Position=("Position", "sum"), **{"Principal Base": ("Principal Base", "sum")},
+        Events=("n", "sum"))
+    return g
+
+
+def apply(rv, tj, log=print):
+    """Returns (rv with TJ columns, {sheet name: DataFrame})."""
+    pv = pivot(tj)
+    key = {(r["Fund Id"], r["Side"], r["Asset ID"]): r for _, r in pv.iterrows()}
+    funds_tj = set(pv["Fund Id"])
+    rv = rv.copy()
+    tp, tb, dp, db, st = [], [], [], [], []
+    used = set()
+    for _, r in rv.iterrows():
+        fid = _acct(r["Fund Id"])
+        k = (fid, r["Side"], _aid(r.get("Asset ID")))
+        if fid not in funds_tj:
+            tp.append(None); tb.append(None); dp.append(None); db.append(None); st.append("NO TJ FOR FUND")
+            continue
+        t = key.get(k)
+        if t is None:
+            tp.append(None); tb.append(None); dp.append(None); db.append(None); st.append("NOT IN TJ")
+            continue
+        used.add(k)
+        nom = r.get("Nominal")
+        amt = r.get("Amount")
+        d1 = None if pd.isna(nom) else float(nom) - t["Position"]
+        d2 = None if pd.isna(amt) else float(amt) - t["Principal Base"]
+        bad = []
+        if d1 is not None and abs(d1) > TOL_POS:
+            bad.append("Position")
+        if d2 is not None and abs(d2) > TOL_AMT:
+            bad.append("Principal Base")
+        tp.append(t["Position"]); tb.append(t["Principal Base"]); dp.append(d1); db.append(d2)
+        st.append("OK" if not bad else "DIFF: " + ", ".join(bad))
+    i = list(rv.columns).index("Status") + 1 if "Status" in rv.columns else len(rv.columns)
+    # put the TJ block after Amount so it sits next to the numbers it checks
+    j = list(rv.columns).index("Amount") + 1 if "Amount" in rv.columns else i
+    for n, (name, vals) in enumerate((("TJ Position", tp), ("TJ Principal Base", tb), ("Position Diff", dp),
+                                      ("Principal Base Diff", db), ("TJ Check", st))):
+        rv.insert(j + n, name, vals)
+
+    # sheet 'TJ Check': whole pivot, flagged
+    pv = pv.copy()
+    pv["In Review"] = [(f, s, a) in used for f, s, a in zip(pv["Fund Id"], pv["Side"], pv["Asset ID"])]
+    rev_funds = {_acct(f) for f in rv["Fund Id"]}
+    pv = pv[pv["Fund Id"].isin(rev_funds)].sort_values(["Fund Id", "Side", "Principal Base"],
+                                                         ascending=[True, True, False])
+    # same name, different Primary Asset ID (merge candidates - information only, nothing is merged)
+    dn = pv.assign(_n=pv["Name"].astype(str).str.strip().str.upper())
+    dn = dn[dn.duplicated(["Fund Id", "Side", "_n"], keep=False)].drop(columns="_n")
+    dn = dn.sort_values(["Fund Id", "Side", "Name"])
+    n_ok = sum(s == "OK" for s in st)
+    n_diff = sum(str(s).startswith("DIFF") for s in st)
+    n_miss = sum(s in ("NOT IN TJ", "NO TJ FOR FUND") for s in st)
+    log(f"Trade Journal check: {n_ok} OK, {n_diff} DIFF, {n_miss} not found in TJ; "
+        f"{len(dn)} TJ lines share a name with another Asset ID (see 'TJ Same Name')")
+    return rv, {"TJ Pivot": pv, "TJ Same Name": dn}
