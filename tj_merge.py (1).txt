@@ -1,0 +1,152 @@
+"""Merge of the same security under several identifiers (Vanguard, ANNUAL cycle), done on the finished Review rows.
+
+The Trade Journal tells which Primary Asset IDs belong to the same security NAME (the manual pivot NAME -> Primary
+Asset ID). Our Final Names (from SOI / Alteryx) tell whether the SOI keeps them apart:
+  * same Final Name + same NAME in the Trade Journal  -> the rows are merged (IDs "ID1, ID2", Nominal and Amount
+    added up, one line) and the list is ranked again by Amount;
+  * different Final Names (e.g. 'Samsung Electronics Co., Ltd.' vs '... Preference Shares', Class A, Primary
+    Exchange)                                         -> NOT merged (logged, so you can see it was checked).
+Nothing is added from outside the Alteryx list. Every decision is in the 'Merge Log' sheet.
+"""
+import re
+
+import pandas as pd
+
+import tj_check as tc
+
+SPLIT = re.compile(r"[,;\s]+")
+STAT_RANK = {"GREEN": 0, "YELLOW": 1, "RED": 2}
+
+
+def _isna(v):
+    return v is None or (isinstance(v, float) and v != v)
+
+
+def _f(v):
+    if _isna(v):
+        return 0.0
+    try:
+        return float(str(v).replace(",", "").strip())
+    except ValueError:
+        return 0.0
+
+
+def _tokens(v):
+    return [] if _isna(v) else [t for t in SPLIT.split(str(v).strip()) if t]
+
+
+def _key(tok):
+    return tok.strip().upper().rstrip("*")
+
+
+def _fn(v):
+    return re.sub(r"\s+", " ", str(v or "")).strip().upper()
+
+
+def merge_review(rv, tj, cfg_m=None, log=print):
+    """-> (rv after merge, Merge Log DataFrame, {(fund id, side): rows absorbed})."""
+    pv = tc.pivot(tj)
+    lines = {(r["Fund Id"], r["Side"], r["Asset ID"]): tc._nname(r["Name"]) for _, r in pv.iterrows()}
+    rv = rv.reset_index(drop=True).copy()
+    if "Merge" not in rv.columns:
+        rv["Merge"] = None
+    logrows, away = [], {}
+    drop = []
+    changed_blocks = set()
+
+    def tjnames(fid, side, ids):
+        return {lines[(fid, side, i)] for i in ids if (fid, side, i) in lines and lines[(fid, side, i)]}
+
+    for (fid_raw, side), blk in rv.groupby(["Fund Id", "Side"], sort=False):
+        fid = tc._acct(fid_raw)
+        info = {}
+        for i, r in blk.iterrows():
+            ids = [_key(t) for t in _tokens(r.get("Asset ID"))]
+            info[i] = {"ids": ids, "tj": tjnames(fid, side, ids), "has_all": bool(ids) and all(
+                (fid, side, x) in lines for x in ids)}
+        # 1) same Final Name -> merge candidates
+        byfn = {}
+        for i, r in blk.iterrows():
+            byfn.setdefault(_fn(r["Final Name"]), []).append(i)
+        for fn, idxs in byfn.items():
+            if len(idxs) < 2 or not fn:
+                continue
+            names = set().union(*(info[i]["tj"] for i in idxs))
+            all_in_tj = all(info[i]["tj"] for i in idxs)
+            descs = {tc._nname(rv.at[i, "Alteryx Description"]) for i in idxs}
+            if all_in_tj and len(names) == 1:
+                why = f"same NAME in Trade Journal ({next(iter(names))})"
+            elif not all_in_tj and len(descs) == 1:
+                why = "ID not in Trade Journal, same Alteryx description"
+            else:
+                logrows.append({
+                    "Fund Id": fid_raw, "Side": side, "Action": "NOT MERGED",
+                    "IDs": " | ".join(", ".join(str(rv.at[i, "Asset ID"]).split()) for i in idxs),
+                    "Final Name": rv.at[idxs[0], "Final Name"], "Old No": ", ".join(str(int(rv.at[i, "No"])) for i in idxs),
+                    "Reason": "same Final Name but the Trade Journal names differ: " + "; ".join(sorted(names)) if names
+                    else "same Final Name, no Trade Journal data and different descriptions - check by hand"})
+                continue
+            sub = rv.loc[idxs].copy()
+            sub["_amt"] = sub["Amount"].map(_f)
+            sub = sub.sort_values("_amt", ascending=False)
+            base_i = sub.index[0]
+            toks, seen = [], set()
+            for i in sub.index:
+                for t in _tokens(rv.at[i, "Asset ID"]):
+                    if _key(t) not in seen:
+                        seen.add(_key(t))
+                        toks.append(t)
+            nos = sorted(int(rv.at[i, "No"]) for i in idxs)
+            old_amts = ", ".join(f"{_f(rv.at[i, 'Amount']):,.0f}" for i in sub.index)
+            rv.at[base_i, "Asset ID"] = ", ".join(toks)
+            rv.at[base_i, "Nominal"] = sum(_f(rv.at[i, "Nominal"]) for i in idxs)
+            rv.at[base_i, "Amount"] = sum(_f(rv.at[i, "Amount"]) for i in idxs)
+            worst = max((rv.at[i, "Status"] for i in idxs), key=lambda s: STAT_RANK.get(s, 0))
+            rv.at[base_i, "Status"] = worst
+            note = f"MERGED rows No {', '.join(map(str, nos))} ({why})"
+            rv.at[base_i, "Merge"] = note
+            c = rv.at[base_i, "Comments"] if "Comments" in rv.columns else None
+            if "Comments" in rv.columns:
+                rv.at[base_i, "Comments"] = (str(c) + "; " if not _isna(c) and str(c) else "") + "merged"
+            drop += [i for i in idxs if i != base_i]
+            away[(fid_raw, side)] = away.get((fid_raw, side), 0) + len(idxs) - 1
+            changed_blocks.add((fid_raw, side))
+            logrows.append({"Fund Id": fid_raw, "Side": side, "Action": "MERGED", "IDs": ", ".join(toks),
+                            "Final Name": rv.at[base_i, "Final Name"], "Old No": ", ".join(map(str, nos)),
+                            "Old Amount": old_amts, "New Amount": rv.at[base_i, "Amount"], "Reason": why})
+        # 2) same NAME in the TJ but different Final Names -> kept apart (information)
+        bytj = {}
+        for i, d in info.items():
+            if len(d["tj"]) == 1:
+                bytj.setdefault(next(iter(d["tj"])), []).append(i)
+        for nm, idxs in bytj.items():
+            fns = {_fn(rv.at[i, "Final Name"]) for i in idxs}
+            if len(idxs) >= 2 and len(fns) >= 2:
+                logrows.append({
+                    "Fund Id": fid_raw, "Side": side, "Action": "KEPT SEPARATE",
+                    "IDs": " | ".join(str(rv.at[i, "Asset ID"]) for i in idxs),
+                    "Final Name": " | ".join(str(rv.at[i, "Final Name"]) for i in idxs),
+                    "Old No": ", ".join(str(int(rv.at[i, "No"])) for i in idxs),
+                    "Reason": f"Trade Journal NAME '{nm}' has several IDs, but the SOI names differ"})
+
+    rv = rv.drop(index=drop)
+    # new ranking only where something was merged
+    rv["_blk"] = rv.groupby(["Fund Id", "Side"], sort=False).ngroup()
+    for (fid_raw, side) in changed_blocks:
+        m = (rv["Fund Id"] == fid_raw) & (rv["Side"] == side)
+        order = rv.loc[m, "Amount"].map(_f).sort_values(ascending=False, kind="stable").index
+        old = {i: int(rv.at[i, "No"]) for i in order}
+        for n, i in enumerate(order, 1):
+            if old[i] != n:
+                note = f"No {old[i]} -> {n}"
+                cur = rv.at[i, "Merge"]
+                rv.at[i, "Merge"] = (str(cur) + "; " if not _isna(cur) and str(cur) else "") + note
+            rv.at[i, "No"] = n
+    rv = rv.sort_values(["_blk", "No"], kind="stable").drop(columns="_blk").reset_index(drop=True)
+    cols = ["Fund Id", "Side", "Action", "IDs", "Final Name", "Old No", "Old Amount", "New Amount", "Reason"]
+    mlog = pd.DataFrame(logrows, columns=cols)
+    n_m = int((mlog["Action"] == "MERGED").sum()) if len(mlog) else 0
+    log(f"Merge (Trade Journal): {n_m} merge(s), {sum(away.values())} row(s) absorbed; "
+        f"{int((mlog['Action'] == 'KEPT SEPARATE').sum()) if len(mlog) else 0} name(s) kept separate (SOI differentiates); "
+        f"nothing is added from outside the Alteryx list")
+    return rv, mlog, away
