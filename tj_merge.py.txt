@@ -1,0 +1,220 @@
+"""Merge of the same security under several identifiers (Vanguard, ANNUAL cycle) + new ranking, based on the Trade Journal.
+
+Runs on the Alteryx rows BEFORE name matching, so merged rows and rows that enter the list go through the normal
+matching (SOI / Bloomberg / PVAL). Rules:
+  * a TJ line = fund + side + Primary Asset ID (tj_check.pivot). The same NAME under >= 2 IDs = merge candidate.
+  * not merged when the SOI shows that security as separate lines (Preference Shares / Primary Exchange / Class ...).
+  * IDs that Alteryx already lists together ("B10RZP7, BVZK7T9") stay together; a temporary ID ("XXXX**") that is
+    not in the TJ is tied to the TJ lines with the same name.
+  * after the merge the list is ranked again by Principal Base: everything above `threshold_pct` % of the total
+    (and at least `min_rows` lines, or all when there are fewer) is kept, the rest drops out.
+Nothing is hidden: every merged / added / dropped / not-merged group is in the 'Merge Log' sheet.
+"""
+import re
+
+import pandas as pd
+
+import tj_check as tc
+
+SPLIT = re.compile(r"[,;\s]+")
+
+
+def _isna(v):
+    return v is None or (isinstance(v, float) and v != v)
+
+
+def _f(v):
+    if _isna(v):
+        return 0.0
+    try:
+        return float(str(v).replace(",", "").strip())
+    except ValueError:
+        return 0.0
+
+
+def _tokens(v):
+    if _isna(v):
+        return []
+    return [t for t in SPLIT.split(str(v).strip()) if t]
+
+
+def _key(tok):
+    return tok.strip().upper().rstrip("*")
+
+
+class _UF:
+    def __init__(self):
+        self.p = {}
+
+    def add(self, x):
+        self.p.setdefault(x, x)
+
+    def find(self, x):
+        self.add(x)
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a, b):
+        self.p[self.find(a)] = self.find(b)
+
+
+def merge_alteryx(ax, tj, soi_lines, cfg_m, log=print):
+    """ax = Alteryx rows (before enrich). Returns (new rows, merge log DataFrame)."""
+    min_rows = int(cfg_m.get("min_rows", 20))
+    pct = float(cfg_m.get("threshold_pct", 1.0))
+    pv = tc.pivot(tj)
+    ax = ax.copy().reset_index(drop=True)
+    ax["_fid"] = [tc._acct(f) for f in ax["fund_id"]]
+    tj_funds = set(pv["Fund Id"])
+    out_parts, logrows = [], []
+    n_merged = n_added = n_dropped = 0
+
+    for (fid, side), g in ax.groupby(["_fid", "side"], sort=False):
+        if fid not in tj_funds:
+            out_parts.append(g.drop(columns="_fid"))
+            continue
+        fund_id_raw = g["fund_id"].iloc[0]
+        lines = {r["Asset ID"]: r for _, r in pv[(pv["Fund Id"] == fid) & (pv["Side"] == side)].iterrows()}
+        uf = _UF()
+        for i in lines:
+            uf.add(i)
+        rows = []                       # (index, tokens, keys)
+        for idx, r in g.iterrows():
+            toks = _tokens(r.get("asset_id"))
+            keys = [_key(t) for t in toks]
+            rows.append((idx, toks, keys))
+            for k in keys:
+                uf.add(k)
+            for k in keys[1:]:
+                uf.union(keys[0], k)
+            uf.add(("row", idx))
+            if keys:
+                uf.union(("row", idx), keys[0])
+        # temporary ID (**) that the TJ does not know: tie it to the TJ lines with the same name
+        by_name = {}
+        for i, ln in lines.items():
+            nn = tc._nname(ln["Name"])
+            if nn:
+                by_name.setdefault(nn, []).append(i)
+        for idx, toks, keys in rows:
+            if any(t.endswith("**") for t in toks) and not any(k in lines for k in keys):
+                for i in by_name.get(tc._nname(g.loc[idx, "description"]), []):
+                    uf.union(("row", idx), i)
+        # same NAME under several IDs: merge unless the SOI keeps them apart
+        for nn, ids in by_name.items():
+            if len(ids) < 2:
+                continue
+            n_soi = soi_lines(fid, lines[ids[0]]["Name"])
+            if n_soi >= 2:
+                logrows.append({"Fund Id": fund_id_raw, "Side": side, "Action": "NOT MERGED",
+                                "IDs": ", ".join(ids), "Name": lines[ids[0]]["Name"],
+                                "Reason": f"SOI lists {n_soi} separate lines for this name"})
+                continue
+            for i in ids[1:]:
+                uf.union(ids[0], i)
+
+        comps = {}
+        for node in list(uf.p):
+            comps.setdefault(uf.find(node), []).append(node)
+        groups = []
+        for nodes in comps.values():
+            ids = [n for n in nodes if isinstance(n, str)]
+            ridx = [n[1] for n in nodes if isinstance(n, tuple)]
+            members = g.loc[ridx] if ridx else g.iloc[0:0]
+            tj_ids = [i for i in ids if i in lines]
+            n_ids_total = len(set(ids))
+            merged = n_ids_total > 1 or len(members) > 1
+            ax_pos, ax_amt = members["nominal"].map(_f).sum(), members["amount"].map(_f).sum()
+            if merged and tj_ids:
+                pos = sum(lines[i]["Position"] for i in tj_ids)
+                amt = sum(lines[i]["Principal Base"] for i in tj_ids)
+            else:
+                pos, amt = ax_pos, ax_amt
+                if not len(members):
+                    pos = sum(lines[i]["Position"] for i in tj_ids)
+                    amt = sum(lines[i]["Principal Base"] for i in tj_ids)
+            groups.append({"ids": ids, "members": members, "tj_ids": tj_ids, "merged": merged,
+                           "pos": pos, "amt": amt})
+        groups.sort(key=lambda x: -x["amt"])
+        total = sum(x["amt"] for x in groups) or 1.0
+        n_pct = sum(1 for x in groups if x["amt"] > total * pct / 100.0)
+        keep_n = max(min(min_rows, len(groups)), n_pct)
+        for rank, x in enumerate(groups, 1):
+            x["rank"] = rank
+            x["keep"] = rank <= keep_n
+
+        new_rows = []
+        for x in groups:
+            mem = x["members"]
+            if not x["keep"]:
+                if len(mem):
+                    n_dropped += 1
+                    logrows.append({"Fund Id": fund_id_raw, "Side": side, "Action": "DROPPED",
+                                    "IDs": ", ".join(x["ids"]), "Name": mem["description"].iloc[0],
+                                    "Old No": ", ".join(str(int(o)) for o in mem["order"]),
+                                    "New No": x["rank"], "Old Amount": mem["amount"].map(_f).sum(),
+                                    "New Amount": x["amt"],
+                                    "Reason": f"rank {x['rank']} after merge: below {pct:g}% and outside top {keep_n}"})
+                continue
+            if len(mem):
+                base = mem.loc[mem["amount"].map(_f).idxmax()].copy()
+                toks = []
+                seen = set()
+                for _, mr in mem.sort_values("amount", key=lambda s: -s.map(_f)).iterrows():
+                    for t in _tokens(mr.get("asset_id")):
+                        if _key(t) not in seen:
+                            seen.add(_key(t))
+                            toks.append(t)
+                extra_ids = [i for i in x["tj_ids"] if i not in seen]
+                toks += extra_ids
+                notes = []
+                ax_pos_m, ax_amt_m = mem["nominal"].map(_f).sum(), mem["amount"].map(_f).sum()
+                if len(mem) > 1:
+                    notes.append(f"merged {len(mem)} Alteryx rows (No {', '.join(str(int(o)) for o in sorted(mem['order']))})")
+                if extra_ids:
+                    notes.append(f"TJ lines added: {', '.join(extra_ids)}")
+                if x["merged"] and not notes and (abs(x["pos"] - ax_pos_m) > tc.TOL_POS or abs(x["amt"] - ax_amt_m) > tc.TOL_AMT):
+                    notes.append(f"quantities from TJ (Alteryx: {ax_pos_m:,.0f} / {ax_amt_m:,.0f})")
+                old_no = int(base["order"])
+                if old_no != x["rank"] or notes:
+                    if old_no != x["rank"]:
+                        notes.append(f"No {old_no} -> {x['rank']}")
+                if x["merged"] and (len(mem) > 1 or extra_ids):
+                    base["asset_id"] = ", ".join(toks)
+                if x["merged"]:
+                    base["nominal"], base["amount"] = x["pos"], x["amt"]
+                base["order"] = x["rank"]
+                base["_merge_note"] = ("MERGED: " if (len(mem) > 1 or extra_ids) else "RANK: ") + "; ".join(notes) if notes else None
+                new_rows.append(base)
+                if len(mem) > 1 or extra_ids:
+                    n_merged += 1
+                    logrows.append({"Fund Id": fund_id_raw, "Side": side, "Action": "MERGED", "IDs": ", ".join(toks),
+                                    "Name": base["description"],
+                                    "Old No": ", ".join(str(int(o)) for o in sorted(mem["order"])), "New No": x["rank"],
+                                    "Old Amount": mem["amount"].map(_f).sum(), "New Amount": x["amt"],
+                                    "Reason": "; ".join(notes)})
+            else:
+                i0 = max(x["tj_ids"], key=lambda i: lines[i]["Principal Base"])
+                n_added += 1
+                nr = {c: None for c in g.columns if c != "_fid"}
+                nr.update({"fund_id": fund_id_raw, "side": side, "order": x["rank"], "description": lines[i0]["Name"],
+                           "asset_id": ", ".join(sorted(x["tj_ids"], key=lambda i: -lines[i]["Principal Base"])),
+                           "nominal": x["pos"], "amount": x["amt"], "file": "Trade Journal",
+                           "_merge_note": f"ADDED from Trade Journal (not in the Alteryx list), rank {x['rank']}"})
+                new_rows.append(pd.Series(nr))
+                logrows.append({"Fund Id": fund_id_raw, "Side": side, "Action": "ADDED", "IDs": nr["asset_id"],
+                                "Name": nr["description"], "New No": x["rank"], "New Amount": x["amt"],
+                                "Reason": f"enters the list after merge (rank {x['rank']})"})
+        if new_rows:
+            part = pd.DataFrame(new_rows).drop(columns=["_fid"], errors="ignore")
+            out_parts.append(part.sort_values("order"))
+    res = pd.concat(out_parts, ignore_index=True) if out_parts else ax.drop(columns="_fid")
+    if "_merge_note" not in res.columns:
+        res["_merge_note"] = None
+    log(f"Merge (Trade Journal): {n_merged} merged, {n_added} added, {n_dropped} dropped"
+        f" (rule: > {pct:g}% of side total, at least {min_rows} lines)")
+    cols = ["Fund Id", "Side", "Action", "IDs", "Name", "Old No", "New No", "Old Amount", "New Amount", "Reason"]
+    mlog = pd.DataFrame(logrows, columns=cols)
+    return res, mlog
