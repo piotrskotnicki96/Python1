@@ -1,0 +1,9 @@
+{
+  "client_name": "Lord Abbett",
+  "soi": {
+    "layout": "lord_abbett"
+  },
+  "name_format": {
+    "style": "issuer_only"
+  }
+}
