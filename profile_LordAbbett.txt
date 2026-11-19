@@ -4,6 +4,81 @@
     "layout": "lord_abbett"
   },
   "name_format": {
-    "style": "issuer_only"
+    "style": "issuer_only",
+    "class_from_alteryx": true,
+    "strip_suffixes": [
+      "EMNT",
+      "GMTN",
+      "EMTN",
+      "MTN",
+      "PERP",
+      "FRN",
+      "SR",
+      "SUB",
+      "NTS",
+      "REGS",
+      "144A",
+      "DISC"
+    ],
+    "noise_phrases": [
+      "REGD",
+      "REG S",
+      "V/R",
+      "/PERP/",
+      "REGS",
+      "CONVERTIBLE"
+    ],
+    "treasury": {
+      "enabled": true,
+      "issuer_regex": "^US TREASURY",
+      "columns": [
+        "SECURITY_TYP2"
+      ],
+      "map": [
+        [
+          "TIPS|INFLATION|INDEXED",
+          "U.S. Treasury Inflation Indexed Bonds"
+        ],
+        [
+          "\\bBILL\\b",
+          "U.S. Treasury Bill"
+        ],
+        [
+          "\\bBOND\\b",
+          "U.S. Treasury Bond"
+        ],
+        [
+          "\\bNOTE\\b",
+          "U.S. Treasury Note"
+        ]
+      ]
+    },
+    "replacements": [
+      [
+        "^(?:United States|US|U\\.S\\.)\\s+Treasury\\b",
+        "U.S. Treasury"
+      ],
+      [
+        "\\s*\\bConvertible\\b",
+        ""
+      ],
+      [
+        "\\bS\\.?\\s?A\\.?\\s?R\\.?\\s?L\\b\\.?",
+        "S.A.R.L."
+      ],
+      [
+        "\\bCo\\b(?![.\\w])",
+        "Co."
+      ]
+    ]
+  },
+  "matching": {
+    "cross_fund_soi": true,
+    "equity_fuzzy_score": 95,
+    "strict_min_issuer": true,
+    "abbrev_issuer": true,
+    "soi_notes": true,
+    "cross_fund_float": true,
+    "compare_frn_coupon": true
   }
 }
